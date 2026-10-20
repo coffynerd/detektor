@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import json
 import time
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ GITHUB_REPO_URL = "https://github.com/coffynerd/detektor.git"
 GITHUB_RAW_VERSION_URL = "https://raw.githubusercontent.com/coffynerd/detektor/main/version.txt"
 
 APP_DIR = "/opt/kasa-alarm"
+DATA_DIR = "/var/lib/kasa-alarm"
 SERVICE_NAME = "kasa-alarm.service"
 # =============================================================
 
@@ -21,7 +23,6 @@ def run_cmd(cmd):
 
 
 def parse_version(v_str):
-    """Zamienia tekst np. '1.1.4' na krotkę liczb (1, 1, 4) do porównania."""
     try:
         return tuple(int(x) for x in v_str.strip().split("."))
     except Exception:
@@ -41,7 +42,6 @@ def get_local_version():
 
 def get_remote_version():
     try:
-        # Dodanie parametru czasu omija 5-minutowy cache serwerów GitHub Raw
         url = f"{GITHUB_RAW_VERSION_URL}?t={int(time.time())}"
         req = urllib.request.Request(
             url,
@@ -59,9 +59,12 @@ def get_remote_version():
 
 
 def option_1_install():
-    print("\n=== [1] INSTALACJA OPROGRAMOWANIA I USŁUGI SYSTEMD ===")
+    print("\n=== [1] INSTALACJA OPROGRAMOWANIA, WEB PUSH I USŁUGI SYSTEMD ===")
     run_cmd("apt-get update")
-    run_cmd("apt-get install -y git python3-flask python3-gpiozero python3-requests python3-lgpio network-manager")
+    run_cmd("apt-get install -y git python3-pip python3-flask python3-gpiozero python3-requests python3-lgpio python3-cryptography network-manager")
+    run_cmd("pip3 install pywebpush py-vapid --break-system-packages")
+
+    os.makedirs(DATA_DIR, exist_ok=True)
 
     if not os.path.exists(os.path.join(APP_DIR, ".git")):
         print(f"Klonowanie repozytorium {GITHUB_REPO_URL} do {APP_DIR}...")
@@ -96,6 +99,8 @@ WantedBy=multi-user.target
     run_cmd("systemctl daemon-reload")
     run_cmd(f"systemctl enable {SERVICE_NAME}")
     run_cmd(f"systemctl restart {SERVICE_NAME}")
+    time.sleep(2)
+    option_6_show_vapid()
     print("\n[OK] Instalacja zakończona! Czujnik działa w tle i włączy się sam po każdym zaniku prądu.")
 
 
@@ -123,7 +128,7 @@ def option_2_update_program():
         else:
             run_cmd(f"rm -rf {APP_DIR} && git clone {GITHUB_REPO_URL} {APP_DIR}")
         run_cmd(f"systemctl restart {SERVICE_NAME}")
-        print(f"\n[OK] Zaktualizowano do wersji {get_local_version()} i zrestartowano usługę czujnika!")
+        print(f"\n[OK] Zaktualizowano do wersji {get_local_version()}! Subskrypcje telefonów w {DATA_DIR} zostały zachowane.")
 
 
 def option_3_wifi():
@@ -165,6 +170,26 @@ def option_5_reboot():
         run_cmd("reboot")
 
 
+def option_6_show_vapid():
+    print("\n=== [6] KLUCZ PUBLICZNY VAPID I STATYSTYKI TELEFONÓW ===")
+    keys_path = os.path.join(DATA_DIR, "vapid_keys.json")
+    subs_path = os.path.join(DATA_DIR, "push_subscriptions.json")
+
+    if os.path.exists(keys_path):
+        with open(keys_path, "r", encoding="utf-8") as f:
+            keys = json.load(f)
+        print(f"Application Server Key (Public Key do kasa.astro lub /api/vapid-public-key):\n\n{keys.get('publicKey')}\n")
+    else:
+        print("[!] Klucze VAPID nie zostały jeszcze wygenerowane (uruchom opcję 1).")
+
+    if os.path.exists(subs_path):
+        with open(subs_path, "r", encoding="utf-8") as f:
+            subs = json.load(f)
+        print(f"Zarejestrowane telefony pracowników: {len(subs)}")
+    else:
+        print("Zarejestrowane telefony pracowników: 0")
+
+
 def main():
     if os.geteuid() != 0:
         print("[!] Uruchom ten skrypt z uprawnieniami administratora:")
@@ -172,18 +197,19 @@ def main():
         sys.exit(1)
 
     while True:
-        print("\n" + "=" * 55)
+        print("\n" + "=" * 58)
         print(f" PANEL ADMINISTRATORA - DETEKTOR (Wersja: {get_local_version()})")
-        print("=" * 55)
-        print("1. Zainstaluj oprogramowanie (pierwszy start / po awarii)")
+        print("=" * 58)
+        print("1. Zainstaluj oprogramowanie i Web Push (pierwszy start)")
         print("2. Zaktualizuj program z GitHuba (sprawdź version.txt)")
         print("3. Konfiguracja Wi-Fi")
         print("4. Aktualizuj system operacyjny (apt update & upgrade)")
         print("5. Uruchom ponownie czujnik / malinkę (reboot)")
+        print("6. Pokaż klucz VAPID i liczbę zapisanych telefonów")
         print("0. Wyjdź")
-        print("-" * 55)
+        print("-" * 58)
 
-        choice = input("Wybierz opcję [0-5]: ").strip()
+        choice = input("Wybierz opcję [0-6]: ").strip()
         if choice == "1":
             option_1_install()
         elif choice == "2":
@@ -194,6 +220,8 @@ def main():
             option_4_system_update()
         elif choice == "5":
             option_5_reboot()
+        elif choice == "6":
+            option_6_show_vapid()
         elif choice == "0":
             print("Do zobaczenia!")
             break
