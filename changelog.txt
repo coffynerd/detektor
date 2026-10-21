@@ -1,2 +1,3 @@
-- Dodano obsługę powiadomień Web Push
-- Dodano zdalną aktualizację z poziomu Panelu Admina
+Wersja 1.0.2:
+- Dostosowano filtr ruchu do wolnego przejścia (5-6s + czas podtrzymania czujnika PIR)
+- Próbkowanie co 4.5s w oknie 20s (alarm uruchamia się po 9 sekundach obecności przy kasie)

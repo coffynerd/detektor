@@ -12,14 +12,20 @@ from pywebpush import webpush, WebPushException
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 
-# ================= KONFIGURACJA SPRZĘTOWA I GITHUB =================
+# ================= KONFIGURACJA SPRZĘTOWA I FILTRU RUCHU =================
 PIR_PIN = 17        # Pin fizyczny 11 - Czujnik ruchu DFRobot SEN0171
 SWITCH_PIN = 27     # Pin fizyczny 13 - Przełącznik ON/OFF (bistabilny)
 HELP_BTN_PIN = 22   # Pin fizyczny 15 - Rezerwacja pod fizyczny przycisk "Wezwij pomoc"
 
-ARM_DELAY_SEC = 5       # Czas na odejście od kasy po włączeniu (5 sekund)
-COOLDOWN_SEC = 60       # Przerwa między kolejnymi powiadomieniami z czujnika (60 sekund)
-ACK_PAUSE_SEC = 120     # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
+ARM_DELAY_SEC = 5           # Czas na odejście od kasy po włączeniu (5 sekund)
+COOLDOWN_SEC = 60           # Przerwa między kolejnymi powiadomieniami z czujnika (60 sekund)
+ACK_PAUSE_SEC = 120         # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
+
+# Filtr fałszywych alarmów (dostosowany do wolnego przejścia 5-6s + ~2.5s podtrzymania PIR):
+# Próbki pobierane w: 0.0s (1/3) -> 4.5s (2/3) -> 9.0s (3/3 = ALARM)
+MOTION_WINDOW_SEC = 20.0      # Okno czasowe pamiętania próbek (20 sekund)
+MOTION_REQUIRED_HITS = 3      # Wymagana liczba potwierdzeń ruchu (3 razy)
+MOTION_SAMPLE_INTERVAL = 4.5  # Odstęp między kolejnymi sprawdzeniami (4.5 sekundy)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = os.path.join(BASE_DIR, "version.txt")
@@ -35,7 +41,7 @@ DATA_DIR = "/var/lib/kasa-alarm"
 SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "push_subscriptions.json")
 VAPID_KEYS_FILE = os.path.join(DATA_DIR, "vapid_keys.json")
 VAPID_CLAIMS = {"sub": "mailto:admin@twojadomena.pl"}
-# ===================================================================
+# =========================================================================
 
 app = Flask(__name__)
 state_lock = threading.Lock()
@@ -45,6 +51,10 @@ system_state = "DISARMED"   # DISARMED | ARMING | ARMED
 alert_type = "NONE"         # NONE | MOTION | HELP
 responder_name = ""
 cooldown_active = False
+
+# Lista znaczników czasu wykrycia ruchu w ostatnich 20 sekundach
+motion_timestamps = []
+last_sample_time = 0.0
 
 arm_timer = None
 cooldown_timer = None
@@ -73,7 +83,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.0"
+        return "1.0.2"
 
 
 def get_local_changelog():
@@ -196,7 +206,7 @@ help_button = Button(HELP_BTN_PIN, pull_up=True, bounce_time=0.1)
 
 
 def cancel_timers():
-    global arm_timer, cooldown_timer, cooldown_active
+    global arm_timer, cooldown_timer, cooldown_active, motion_timestamps
     if arm_timer is not None:
         arm_timer.cancel()
         arm_timer = None
@@ -204,20 +214,23 @@ def cancel_timers():
         cooldown_timer.cancel()
         cooldown_timer = None
     cooldown_active = False
+    motion_timestamps.clear()
 
 
 def finish_arming():
-    global system_state
+    global system_state, motion_timestamps
     with state_lock:
         if system_state == "ARMING":
+            motion_timestamps.clear()
             system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu.")
+            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (filtr 3x co 4.5s w oknie 20s).")
 
 
 def reset_cooldown():
-    global cooldown_active, alert_type, responder_name
+    global cooldown_active, alert_type, responder_name, motion_timestamps
     with state_lock:
         cooldown_active = False
+        motion_timestamps.clear()
         if alert_type == "MOTION":
             alert_type = "NONE"
             responder_name = ""
@@ -244,22 +257,53 @@ def on_switch_off():
         print("[SYSTEM] Wyłączono przełącznik - system rozbrojony natychmiast.")
 
 
-def on_motion_detected():
-    global alert_type, responder_name, cooldown_active, cooldown_timer
+def register_motion_hit():
+    """Zlicza próbkę ruchu co 4.5s w oknie 20s i wyzwala alarm przy 3 potwierdzeniach (9s obecności)."""
+    global alert_type, responder_name, cooldown_active, cooldown_timer, motion_timestamps, last_sample_time
+    now = time.time()
+
     with state_lock:
         if system_state != "ARMED" or cooldown_active:
             return
-        alert_type = "MOTION"
-        responder_name = ""
-        cooldown_active = True
-        print("[ALARM] Wykryto ruch przy kasie!")
-        send_push_to_all(
-            "🚨 Ruch przy kasie!",
-            "Klient czeka przy pustej kasie! Kliknij, aby przyjąć.",
-            "MOTION"
-        )
-        cooldown_timer = threading.Timer(COOLDOWN_SEC, reset_cooldown)
-        cooldown_timer.start()
+
+        # Odrzucamy próbki częstsze niż MOTION_SAMPLE_INTERVAL (4.5s), aby przejście
+        # trwające 5-6s (+2.5s podtrzymania PIR) dało maksymalnie 2 z 3 trafień
+        if now - last_sample_time < MOTION_SAMPLE_INTERVAL:
+            return
+
+        last_sample_time = now
+
+        # Usuwamy stare trafienia sprzed więcej niż 20 sekund
+        motion_timestamps = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
+        motion_timestamps.append(now)
+
+        hits = len(motion_timestamps)
+        print(f"[DETEKTOR] Wykryto ruch przy kasie ({hits}/{MOTION_REQUIRED_HITS} w ciągu ostatnich {int(MOTION_WINDOW_SEC)}s)")
+
+        if hits >= MOTION_REQUIRED_HITS:
+            motion_timestamps.clear()
+            alert_type = "MOTION"
+            responder_name = ""
+            cooldown_active = True
+            print("[ALARM] Potwierdzono obecność klienta przy kasie (3/3 - min. 9s)! Wysyłam powiadomienia.")
+            send_push_to_all(
+                "🚨 Klient czeka przy kasie!",
+                "Wykryto stałą obecność przy pustej kasie. Kliknij, aby przyjąć.",
+                "MOTION"
+            )
+            cooldown_timer = threading.Timer(COOLDOWN_SEC, reset_cooldown)
+            cooldown_timer.start()
+
+
+def motion_monitor_loop():
+    """
+    Pętla w tle sprawdzająca ciągłą obecność (gdy klient stoi przy kasie i czujnik PIR
+    utrzymuje stan wysoki bez opadania sygnału).
+    """
+    while True:
+        time.sleep(0.5)
+        if system_state == "ARMED" and not cooldown_active and pir.motion_detected:
+            register_motion_hit()
 
 
 def trigger_help_request():
@@ -277,11 +321,14 @@ def trigger_help_request():
 
 switch.when_pressed = on_switch_on
 switch.when_released = on_switch_off
-pir.when_motion = on_motion_detected
+pir.when_motion = register_motion_hit
 help_button.when_pressed = trigger_help_request
 
 if switch.is_pressed:
     on_switch_on()
+
+# Uruchomienie wątku monitorującego ciągłą obecność przy kasie
+threading.Thread(target=motion_monitor_loop, daemon=True).start()
 
 
 # ================= ENDPOINTY REST API =================
@@ -311,11 +358,15 @@ def subscribe_push():
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
+    now = time.time()
     with state_lock:
+        active_hits = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
         return jsonify({
             "system_state": system_state,
             "alert_type": alert_type,
             "responder_name": responder_name,
+            "motion_hits": len(active_hits),
+            "motion_required": MOTION_REQUIRED_HITS,
             "version": get_local_version(),
             "subscribed_devices": len(load_subscriptions())
         })
@@ -336,6 +387,7 @@ def api_ack():
             if cooldown_timer is not None:
                 cooldown_timer.cancel()
             cooldown_active = True
+            motion_timestamps.clear()
             cooldown_timer = threading.Timer(ACK_PAUSE_SEC, reset_cooldown)
             cooldown_timer.start()
             send_push_to_all(
@@ -359,10 +411,11 @@ def api_clear():
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
 
-    global alert_type, responder_name
+    global alert_type, responder_name, motion_timestamps
     with state_lock:
         alert_type = "NONE"
         responder_name = ""
+        motion_timestamps.clear()
     return jsonify({"ok": True})
 
 
@@ -370,7 +423,6 @@ def api_clear():
 
 @app.route("/api/update-check", methods=["GET"])
 def api_update_check():
-    """Sprawdza na GitHubie (version.txt oraz changelog.txt), czy jest nowa wersja."""
     local_ver = get_local_version()
     remote_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
     remote_changelog = fetch_github_text(GITHUB_RAW_CHANGELOG_URL)
@@ -394,7 +446,6 @@ def api_update_check():
 
 @app.route("/api/update-run", methods=["POST", "OPTIONS"])
 def api_update_run():
-    """Pobiera nową wersję z GitHuba i restartuje usługę systemd."""
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
 
