@@ -1,0 +1,2 @@
+- Dodano obsługę powiadomień Web Push
+- Dodano zdalną aktualizację z poziomu Panelu Admina

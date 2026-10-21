@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 import os
+import time
 import json
 import base64
 import threading
-from flask import Flask, render_template_string, jsonify, request
+import subprocess
+import urllib.request
+from flask import Flask, jsonify, request
 from gpiozero import MotionSensor, Button
 from pywebpush import webpush, WebPushException
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 
-# ================= KONFIGURACJA SPRZĘTOWA =================
+# ================= KONFIGURACJA SPRZĘTOWA I GITHUB =================
 PIR_PIN = 17        # Pin fizyczny 11 - Czujnik ruchu DFRobot SEN0171
 SWITCH_PIN = 27     # Pin fizyczny 13 - Przełącznik ON/OFF (bistabilny)
 HELP_BTN_PIN = 22   # Pin fizyczny 15 - Rezerwacja pod fizyczny przycisk "Wezwij pomoc"
@@ -18,20 +21,26 @@ ARM_DELAY_SEC = 5       # Czas na odejście od kasy po włączeniu (5 sekund)
 COOLDOWN_SEC = 60       # Przerwa między kolejnymi powiadomieniami z czujnika (60 sekund)
 ACK_PAUSE_SEC = 120     # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
 
-# Stały katalog danych (poza folderem Gita - nie kasuje się podczas aktualizacji z GitHuba)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VERSION_FILE = os.path.join(BASE_DIR, "version.txt")
+CHANGELOG_FILE = os.path.join(BASE_DIR, "changelog.txt")
+
+GITHUB_REPO_URL = "https://github.com/coffynerd/detektor.git"
+GITHUB_RAW_VERSION_URL = "https://raw.githubusercontent.com/coffynerd/detektor/main/version.txt"
+GITHUB_RAW_CHANGELOG_URL = "https://raw.githubusercontent.com/coffynerd/detektor/main/changelog.txt"
+SERVICE_NAME = "kasa-alarm.service"
+
+# Stały katalog danych (nie kasuje się podczas aktualizacji z GitHuba)
 DATA_DIR = "/var/lib/kasa-alarm"
 SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "push_subscriptions.json")
 VAPID_KEYS_FILE = os.path.join(DATA_DIR, "vapid_keys.json")
 VAPID_CLAIMS = {"sub": "mailto:admin@twojadomena.pl"}
-
-VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.txt")
-# ==========================================================
+# ===================================================================
 
 app = Flask(__name__)
 state_lock = threading.Lock()
 subs_lock = threading.Lock()
 
-# Zmienne stanu systemu
 system_state = "DISARMED"   # DISARMED | ARMING | ARMED
 alert_type = "NONE"         # NONE | MOTION | HELP
 responder_name = ""
@@ -51,9 +60,50 @@ def add_cors_and_pna_headers(response):
     return response
 
 
+# --- Pomocnicze funkcje wersji i aktualizacji ---
+def parse_version(v_str):
+    try:
+        return tuple(int(x) for x in v_str.strip().split("."))
+    except Exception:
+        return (0, 0, 0)
+
+
+def get_local_version():
+    try:
+        with open(VERSION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return "1.0.0"
+
+
+def get_local_changelog():
+    try:
+        with open(CHANGELOG_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return "Brak opisu zmian."
+
+
+def fetch_github_text(raw_url):
+    try:
+        url = f"{raw_url}?t={int(time.time())}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return response.read().decode("utf-8").strip()
+    except Exception as e:
+        print(f"[GITHUB FETCH ERROR] {raw_url}: {e}")
+        return None
+
+
 # --- Automatyczne generowanie i odczyt kluczy VAPID ---
 def init_vapid_keys():
-    """Generuje klucze VAPID przy pierwszym starcie i zapisuje je poza repozytorium GitHub."""
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(VAPID_KEYS_FILE):
         try:
@@ -78,7 +128,6 @@ def init_vapid_keys():
     with open(VAPID_KEYS_FILE, "w", encoding="utf-8") as f:
         json.dump({"publicKey": pub_b64, "privateKey": priv_b64}, f, indent=2)
 
-    print(f"[VAPID] Klucz publiczny (Application Server Key): {pub_b64}")
     return pub_b64, priv_b64
 
 
@@ -103,7 +152,6 @@ def save_subscriptions(subs):
 
 
 def send_push_to_all(title, body, push_alert_type="MOTION"):
-    """Wysyła natywne powiadomienie Web Push budzące zablokowane telefony pracowników."""
     def _send_worker():
         with subs_lock:
             subs = load_subscriptions()
@@ -128,7 +176,6 @@ def send_push_to_all(title, body, push_alert_type="MOTION"):
                     )
                     valid_subs.append(sub)
                 except WebPushException as ex:
-                    # Jeśli pracownik odinstalował PWA lub wyczyścił dane (HTTP 404/410), usuwamy wpis
                     if ex.response is not None and ex.response.status_code in [404, 410]:
                         continue
                     valid_subs.append(sub)
@@ -146,14 +193,6 @@ def send_push_to_all(title, body, push_alert_type="MOTION"):
 pir = MotionSensor(PIR_PIN)
 switch = Button(SWITCH_PIN, pull_up=True, bounce_time=0.1)
 help_button = Button(HELP_BTN_PIN, pull_up=True, bounce_time=0.1)
-
-
-def get_local_version():
-    try:
-        with open(VERSION_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return "1.0.0"
 
 
 def cancel_timers():
@@ -266,7 +305,6 @@ def subscribe_push():
         if not any(s.get("endpoint") == sub["endpoint"] for s in subs):
             subs.append(sub)
             save_subscriptions(subs)
-            print(f"[WEB PUSH] Zarejestrowano nowy telefon (łącznie: {len(subs)})")
 
     return jsonify({"status": "subscribed"}), 201
 
@@ -326,6 +364,66 @@ def api_clear():
         alert_type = "NONE"
         responder_name = ""
     return jsonify({"ok": True})
+
+
+# --- ENDPOINTY AKTUALIZACJI DLA PANELU ADMINA ---
+
+@app.route("/api/update-check", methods=["GET"])
+def api_update_check():
+    """Sprawdza na GitHubie (version.txt oraz changelog.txt), czy jest nowa wersja."""
+    local_ver = get_local_version()
+    remote_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
+    remote_changelog = fetch_github_text(GITHUB_RAW_CHANGELOG_URL)
+
+    if not remote_ver:
+        return jsonify({
+            "ok": False,
+            "error": "Brak połączenia z GitHubem lub brak pliku version.txt w repozytorium.",
+            "local_version": local_ver
+        }), 502
+
+    is_newer = parse_version(remote_ver) > parse_version(local_ver)
+    return jsonify({
+        "ok": True,
+        "local_version": local_ver,
+        "remote_version": remote_ver,
+        "update_available": is_newer,
+        "changelog": remote_changelog or "Brak pliku changelog.txt w repozytorium."
+    })
+
+
+@app.route("/api/update-run", methods=["POST", "OPTIONS"])
+def api_update_run():
+    """Pobiera nową wersję z GitHuba i restartuje usługę systemd."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    try:
+        if os.path.exists(os.path.join(BASE_DIR, ".git")):
+            cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
+        else:
+            cmd = f"rm -rf {BASE_DIR} && git clone {GITHUB_REPO_URL} {BASE_DIR}"
+
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            return jsonify({"ok": False, "error": res.stderr}), 500
+
+        new_ver = get_local_version()
+
+        def _restart_service():
+            time.sleep(1.5)
+            subprocess.run(f"systemctl restart {SERVICE_NAME}", shell=True)
+
+        threading.Thread(target=_restart_service, daemon=True).start()
+
+        return jsonify({
+            "ok": True,
+            "status": "restarting",
+            "new_version": new_ver,
+            "changelog": get_local_changelog()
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/")
