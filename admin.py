@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import sys
 import json
 import time
@@ -18,9 +19,13 @@ GITHUB_ADMIN_SCRIPT_URL = f"{RAW_BASE_URL}/admin.py"
 APP_DIR = "/opt/kasa-alarm"
 VENV_DIR = "/opt/kasa-alarm/venv"
 DATA_DIR = "/var/lib/kasa-alarm"
-SERVICE_NAME = "kasa-alarm.service"
+PUBLIC_URL_FILE = os.path.join(DATA_DIR, "public_url.txt")
+CLOUD_CONFIG_FILE = os.path.join(DATA_DIR, "cloud_config.json")
 
-FALLBACK_ADMIN_VERSION = "1.0.1"
+SERVICE_NAME = "kasa-alarm.service"
+TUNNEL_SERVICE_NAME = "kasa-tunnel.service"
+
+FALLBACK_ADMIN_VERSION = "1.0.2"
 # =============================================================
 
 
@@ -82,13 +87,12 @@ def get_local_admin_version():
 
 
 def option_1_install():
-    print("\n=== [1] INSTALACJA OPROGRAMOWANIA, VENV I USŁUGI SYSTEMD (v1.0.1) ===")
+    print("\n=== [1] INSTALACJA OPROGRAMOWANIA, VENV I USŁUGI SYSTEMD ===")
     run_cmd("apt-get update")
-    run_cmd("apt-get install -y git python3-venv python3-pip python3-flask python3-gpiozero python3-requests python3-lgpio python3-cryptography network-manager")
+    run_cmd("apt-get install -y git openssh-client python3-venv python3-pip python3-flask python3-gpiozero python3-requests python3-lgpio python3-cryptography network-manager")
 
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # Klonowanie lub aktualizacja kodu w /opt/kasa-alarm
     if not os.path.exists(os.path.join(APP_DIR, ".git")):
         print(f"Klonowanie repozytorium {GITHUB_REPO_URL} do {APP_DIR}...")
         shutil.rmtree(APP_DIR, ignore_errors=True)
@@ -101,11 +105,10 @@ def option_1_install():
     else:
         run_cmd(f"cd {APP_DIR} && git fetch --all && git reset --hard origin/main")
 
-    # Tworzenie venv z dostępem do pakietów systemowych (lgpio, flask, gpiozero)
     print("\nTworzenie środowiska wirtualnego venv (--system-site-packages)...")
     shutil.rmtree(VENV_DIR, ignore_errors=True)
     run_cmd(f"python3 -m venv --system-site-packages {VENV_DIR}")
-    run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid")
+    run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid requests")
 
     service_content = f"""[Unit]
 Description=System Czujnika Ruchu i Przycisku Pomocy przy Kasie (detektor)
@@ -157,7 +160,7 @@ def option_2_update_app():
         else:
             run_cmd(f"rm -rf {APP_DIR} && git clone {GITHUB_REPO_URL} {APP_DIR}")
             run_cmd(f"python3 -m venv --system-site-packages {VENV_DIR}")
-            run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid")
+            run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid requests")
         run_cmd(f"systemctl restart {SERVICE_NAME}")
         print(f"\n[OK] Zaktualizowano program czujnika do wersji {get_local_app_version()} i zrestartowano usługę!")
 
@@ -252,7 +255,7 @@ def option_7_show_vapid():
             keys = json.load(f)
         print(f"Application Server Key (Public Key):\n\n{keys.get('publicKey')}\n")
     else:
-        print("[!] Klucze VAPID nie zostały jeszcze wygenerowane (serwer app.py jeszcze nie wystartował).")
+        print("[!] Klucze VAPID nie zostały jeszcze wygenerowane.")
 
     if os.path.exists(subs_path):
         with open(subs_path, "r", encoding="utf-8") as f:
@@ -265,9 +268,129 @@ def option_7_show_vapid():
 def option_8_diagnostics():
     print("\n=== [8] DIAGNOSTYKA SERWERA I LOGI BŁĘDÓW ===")
     run_cmd("hostname -I")
+    if os.path.exists(PUBLIC_URL_FILE):
+        with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
+            pub = f.read().strip()
+        if pub:
+            print(f"Aktywny adres publiczny HTTPS (Tunel): {pub}")
     run_cmd("curl -i http://localhost:5000/api/status")
-    print("\n--- Ostatnie 20 linii logów usługi kasa-alarm.service ---")
-    run_cmd(f"journalctl -u {SERVICE_NAME} -n 20 --no-pager")
+    print("\n--- Ostatnie 15 linii logów usługi kasa-alarm.service ---")
+    run_cmd(f"journalctl -u {SERVICE_NAME} -n 15 --no-pager")
+
+
+def option_9_tunnel():
+    print("\n=== [9] DARMOWY TUNEL HTTPS (DOSTĘP SPOZA WI-FI / NA LTE) ===")
+    print("Tunel wystawia malinkę pod bezpiecznym adresem https://... bez publicznego IP.")
+    print("a) Włącz / Zrestartuj darmowy tunel HTTPS (localhost.run przez SSH - bez konta)")
+    print("b) Pokaż aktualny adres publiczny HTTPS tunelu")
+    print("c) Wyłącz tunel HTTPS")
+    print("0) Powrót")
+    sub = input("Wybierz (a/b/c/0): ").strip().lower()
+
+    if sub == "a":
+        os.makedirs(DATA_DIR, exist_ok=True)
+        # Generujemy klucz SSH dla root, jeśli jeszcze nie istnieje (wymagane przez localhost.run)
+        ssh_key_path = "/root/.ssh/id_ed25519"
+        if not os.path.exists(ssh_key_path):
+            os.makedirs("/root/.ssh", exist_ok=True)
+            run_cmd(f'ssh-keygen -t ed25519 -f {ssh_key_path} -N "" -q')
+
+        tunnel_runner = os.path.join(DATA_DIR, "run_tunnel.py")
+        runner_code = f'''#!/usr/bin/env python3
+import re
+import time
+import subprocess
+
+PUBLIC_URL_FILE = "{PUBLIC_URL_FILE}"
+
+while True:
+    proc = subprocess.Popen(
+        [
+            "ssh", "-o", "StrictHostKeyChecking=no",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", "80:localhost:5000", "nokey@localhost.run"
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        match = re.search(r"(https://[a-zA-Z0-9.-]+\\.lhr\\.life)", line)
+        if match:
+            url = match.group(1)
+            with open(PUBLIC_URL_FILE, "w", encoding="utf-8") as f:
+                f.write(url)
+    proc.wait()
+    time.sleep(5)
+'''
+        with open(tunnel_runner, "w", encoding="utf-8") as f:
+            f.write(runner_code)
+        os.chmod(tunnel_runner, 0o755)
+
+        tunnel_service = f"""[Unit]
+Description=Publiczny Tunel HTTPS dla Czujnika Kasy (localhost.run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 {tunnel_runner}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+        with open(f"/etc/systemd/system/{TUNNEL_SERVICE_NAME}", "w", encoding="utf-8") as f:
+            f.write(tunnel_service)
+
+        run_cmd("systemctl daemon-reload")
+        run_cmd(f"systemctl enable {TUNNEL_SERVICE_NAME}")
+        run_cmd(f"systemctl restart {TUNNEL_SERVICE_NAME}")
+        print("\nCzekam 5 sekund na wygenerowanie adresu HTTPS...")
+        time.sleep(5)
+        if os.path.exists(PUBLIC_URL_FILE):
+            with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
+                print(f"\n[OK] Twój publiczny adres HTTPS (wpisz w 2. polu w Panelu Admina):\n>>> {f.read().strip()} <<<\n")
+        else:
+            print("[i] Tunel startuje w tle. Wybierz za chwilę opcję 9 -> b, aby odczytać adres.")
+
+    elif sub == "b":
+        if os.path.exists(PUBLIC_URL_FILE):
+            with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
+                print(f"\nAktualny adres publiczny HTTPS:\n>>> {f.read().strip()} <<<\n")
+        else:
+            print("\n[!] Brak zapisanego adresu. Uruchom najpierw opcję 9 -> a.")
+
+    elif sub == "c":
+        run_cmd(f"systemctl stop {TUNNEL_SERVICE_NAME}")
+        run_cmd(f"systemctl disable {TUNNEL_SERVICE_NAME}")
+        if os.path.exists(PUBLIC_URL_FILE):
+            os.remove(PUBLIC_URL_FILE)
+        print("[OK] Tunel HTTPS został wyłączony.")
+
+
+def option_10_firebase_relay():
+    print("\n=== [10] KONFIGURACJA FIREBASE RELAY (SERWER POŚREDNICZĄCY) ===")
+    print("Jeśli podasz URL swojej bazy Firebase Realtime Database (np. https://twoj-projekt.firebaseio.com),")
+    print("malinka będzie co 2s synchronizować stan z chmurą bez potrzeby używania tuneli i przekierowania portów.")
+    current_url = ""
+    if os.path.exists(CLOUD_CONFIG_FILE):
+        try:
+            with open(CLOUD_CONFIG_FILE, "r", encoding="utf-8") as f:
+                current_url = json.load(f).get("firebase_db_url", "")
+        except Exception:
+            pass
+    print(f"Aktualny adres Firebase DB: {current_url or 'Brak (wyłączone)'}")
+    new_url = input("Podaj nowy URL bazy Firebase (lub wciśnij Enter, aby wyłączyć): ").strip()
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CLOUD_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({"firebase_db_url": new_url}, f, indent=2)
+    run_cmd(f"systemctl restart {SERVICE_NAME}")
+    print("[OK] Zapisano konfigurację Firebase Relay i zrestartowano usługę.")
 
 
 def main():
@@ -277,9 +400,9 @@ def main():
         sys.exit(1)
 
     while True:
-        print("\n" + "=" * 66)
+        print("\n" + "=" * 68)
         print(f" PANEL ADMINISTRATORA v{get_local_admin_version()} | Program czujnika: v{get_local_app_version()}")
-        print("=" * 66)
+        print("=" * 68)
         print("1. Zainstaluj oprogramowanie i Web Push (pierwszy start / po awarii)")
         print("2. Zaktualizuj program czujnika z GitHuba (sprawdź version.txt)")
         print("3. Zaktualizuj ten Panel Administratora (sprawdź admin_version.txt)")
@@ -288,10 +411,12 @@ def main():
         print("6. Uruchom ponownie czujnik / malinkę (reboot)")
         print("7. Pokaż klucz VAPID i liczbę zapisanych telefonów")
         print("8. Diagnostyka serwera i podgląd logów błędów")
+        print("9. Darmowy Tunel HTTPS (dostęp spoza Wi-Fi / na LTE)")
+        print("10. Konfiguracja Firebase Relay (chmurowy serwer pośredniczący)")
         print("0. Wyjdź")
-        print("-" * 66)
+        print("-" * 68)
 
-        choice = input("Wybierz opcję [0-8]: ").strip()
+        choice = input("Wybierz opcję [0-10]: ").strip()
         if choice == "1":
             option_1_install()
         elif choice == "2":
@@ -308,6 +433,10 @@ def main():
             option_7_show_vapid()
         elif choice == "8":
             option_8_diagnostics()
+        elif choice == "9":
+            option_9_tunnel()
+        elif choice == "10":
+            option_10_firebase_relay()
         elif choice == "0":
             print("Do zobaczenia!")
             break
