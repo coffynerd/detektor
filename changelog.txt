@@ -1,4 +1,5 @@
 Wersja 1.0.4:
+- Dodano endpoint POST /api/unsubscribe (natychmiastowa aktualizacja licznika zapisanych telefonów po wyłączeniu powiadomień)
 - Dodano obsługę połączeń spoza sieci Wi-Fi (automatyczny tunel HTTPS oraz synchronizacja Firebase Relay)
 - Rozbudowano nagłówki CORS o obsługę tuneli publicznych (LTE/5G)
 - Dodano zwracanie aktywnego adresu publicznego (public_url) bezpośrednio w /api/status
