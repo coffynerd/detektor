@@ -22,7 +22,6 @@ COOLDOWN_SEC = 60           # Przerwa między kolejnymi powiadomieniami z czujni
 ACK_PAUSE_SEC = 120         # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
 
 # Filtr fałszywych alarmów (dostosowany do wolnego przejścia 5-6s + ~2.5s podtrzymania PIR):
-# Próbki pobierane w: 0.0s (1/3) -> 4.5s (2/3) -> 9.0s (3/3 = ALARM)
 MOTION_WINDOW_SEC = 20.0      # Okno czasowe pamiętania próbek (20 sekund)
 MOTION_REQUIRED_HITS = 3      # Wymagana liczba potwierdzeń ruchu (3 razy)
 MOTION_SAMPLE_INTERVAL = 4.5  # Odstęp między kolejnymi sprawdzeniami (4.5 sekundy)
@@ -52,7 +51,6 @@ alert_type = "NONE"         # NONE | MOTION | HELP
 responder_name = ""
 cooldown_active = False
 
-# Lista znaczników czasu wykrycia ruchu w ostatnich 20 sekundach
 motion_timestamps = []
 last_sample_time = 0.0
 
@@ -60,7 +58,6 @@ arm_timer = None
 cooldown_timer = None
 
 
-# --- Nagłówki CORS oraz Private Network Access (dla strony HTTPS / Astro) ---
 @app.after_request
 def add_cors_and_pna_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -70,7 +67,6 @@ def add_cors_and_pna_headers(response):
     return response
 
 
-# --- Pomocnicze funkcje wersji i aktualizacji ---
 def parse_version(v_str):
     try:
         return tuple(int(x) for x in v_str.strip().split("."))
@@ -83,7 +79,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.2"
+        return "1.0.3"
 
 
 def get_local_changelog():
@@ -112,7 +108,6 @@ def fetch_github_text(raw_url):
         return None
 
 
-# --- Automatyczne generowanie i odczyt kluczy VAPID ---
 def init_vapid_keys():
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(VAPID_KEYS_FILE):
@@ -144,7 +139,6 @@ def init_vapid_keys():
 VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY = init_vapid_keys()
 
 
-# --- Zarządzanie subskrypcjami Web Push ---
 def load_subscriptions():
     if not os.path.exists(SUBSCRIPTIONS_FILE):
         return []
@@ -199,7 +193,6 @@ def send_push_to_all(title, body, push_alert_type="MOTION"):
     threading.Thread(target=_send_worker, daemon=True).start()
 
 
-# --- Inicjalizacja GPIO ---
 pir = MotionSensor(PIR_PIN)
 switch = Button(SWITCH_PIN, pull_up=True, bounce_time=0.1)
 help_button = Button(HELP_BTN_PIN, pull_up=True, bounce_time=0.1)
@@ -223,7 +216,7 @@ def finish_arming():
         if system_state == "ARMING":
             motion_timestamps.clear()
             system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (filtr 3x co 4.5s w oknie 20s).")
+            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (v1.0.3).")
 
 
 def reset_cooldown():
@@ -258,7 +251,6 @@ def on_switch_off():
 
 
 def register_motion_hit():
-    """Zlicza próbkę ruchu co 4.5s w oknie 20s i wyzwala alarm przy 3 potwierdzeniach (9s obecności)."""
     global alert_type, responder_name, cooldown_active, cooldown_timer, motion_timestamps, last_sample_time
     now = time.time()
 
@@ -266,26 +258,22 @@ def register_motion_hit():
         if system_state != "ARMED" or cooldown_active:
             return
 
-        # Odrzucamy próbki częstsze niż MOTION_SAMPLE_INTERVAL (4.5s), aby przejście
-        # trwające 5-6s (+2.5s podtrzymania PIR) dało maksymalnie 2 z 3 trafień
         if now - last_sample_time < MOTION_SAMPLE_INTERVAL:
             return
 
         last_sample_time = now
-
-        # Usuwamy stare trafienia sprzed więcej niż 20 sekund
         motion_timestamps = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
         motion_timestamps.append(now)
 
         hits = len(motion_timestamps)
-        print(f"[DETEKTOR] Wykryto ruch przy kasie ({hits}/{MOTION_REQUIRED_HITS} w ciągu ostatnich {int(MOTION_WINDOW_SEC)}s)")
+        print(f"[DETEKTOR] Wykryto ruch przy kasie ({hits}/{MOTION_REQUIRED_HITS})")
 
         if hits >= MOTION_REQUIRED_HITS:
             motion_timestamps.clear()
             alert_type = "MOTION"
             responder_name = ""
             cooldown_active = True
-            print("[ALARM] Potwierdzono obecność klienta przy kasie (3/3 - min. 9s)! Wysyłam powiadomienia.")
+            print("[ALARM] Potwierdzono obecność klienta przy kasie (3/3)! Wysyłam powiadomienia.")
             send_push_to_all(
                 "🚨 Klient czeka przy kasie!",
                 "Wykryto stałą obecność przy pustej kasie. Kliknij, aby przyjąć.",
@@ -296,10 +284,6 @@ def register_motion_hit():
 
 
 def motion_monitor_loop():
-    """
-    Pętla w tle sprawdzająca ciągłą obecność (gdy klient stoi przy kasie i czujnik PIR
-    utrzymuje stan wysoki bez opadania sygnału).
-    """
     while True:
         time.sleep(0.5)
         if system_state == "ARMED" and not cooldown_active and pir.motion_detected:
@@ -327,11 +311,8 @@ help_button.when_pressed = trigger_help_request
 if switch.is_pressed:
     on_switch_on()
 
-# Uruchomienie wątku monitorującego ciągłą obecność przy kasie
 threading.Thread(target=motion_monitor_loop, daemon=True).start()
 
-
-# ================= ENDPOINTY REST API =================
 
 @app.route("/api/vapid-public-key", methods=["GET"])
 def get_vapid_public_key():
@@ -419,8 +400,6 @@ def api_clear():
     return jsonify({"ok": True})
 
 
-# --- ENDPOINTY AKTUALIZACJI DLA PANELU ADMINA ---
-
 @app.route("/api/update-check", methods=["GET"])
 def api_update_check():
     local_ver = get_local_version()
@@ -430,7 +409,7 @@ def api_update_check():
     if not remote_ver:
         return jsonify({
             "ok": False,
-            "error": "Brak połączenia z GitHubem lub brak pliku version.txt w repozytorium.",
+            "error": "Brak połączenia z GitHubem lub brak pliku version.txt.",
             "local_version": local_ver
         }), 502
 
@@ -440,7 +419,7 @@ def api_update_check():
         "local_version": local_ver,
         "remote_version": remote_ver,
         "update_available": is_newer,
-        "changelog": remote_changelog or "Brak pliku changelog.txt w repozytorium."
+        "changelog": remote_changelog or "Brak pliku changelog.txt."
     })
 
 
