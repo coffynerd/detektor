@@ -377,10 +377,8 @@ def firebase_relay_loop():
                     "last_updated": int(now * 1000)
                 }
 
-            # Wysyłka aktualnego stanu malinki do chmury
             requests.put(f"{db_url}/kasa_relay/status.json", json=status_payload, timeout=3)
 
-            # Sprawdzenie, czy pracownik spoza Wi-Fi wysłał komendę (ACK / HELP / CLEAR)
             cmd_res = requests.get(f"{db_url}/kasa_relay/command.json", timeout=3)
             if cmd_res.status_code == 200 and cmd_res.json():
                 cmd_data = cmd_res.json()
@@ -395,7 +393,6 @@ def firebase_relay_loop():
                         alert_type = "NONE"
                         responder_name = ""
                         motion_timestamps.clear()
-                # Po wykonaniu komendy czyścimy kolejkę w chmurze
                 requests.delete(f"{db_url}/kasa_relay/command.json", timeout=3)
         except Exception as e:
             print(f"[FIREBASE RELAY WARN] {e}")
@@ -434,8 +431,30 @@ def subscribe_push():
         if not any(s.get("endpoint") == sub["endpoint"] for s in subs):
             subs.append(sub)
             save_subscriptions(subs)
+            print(f"[WEB PUSH] Dodano subskrypcję (łącznie: {len(subs)})")
 
-    return jsonify({"status": "subscribed"}), 201
+    return jsonify({"status": "subscribed", "subscribed_devices": len(subs)}), 201
+
+
+@app.route("/api/unsubscribe", methods=["POST", "OPTIONS"])
+def unsubscribe_push():
+    """Natychmiastowo usuwa subskrypcję telefonu po kliknięciu wyłączenia powiadomień."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    data = request.get_json(silent=True) or {}
+    endpoint = data.get("endpoint")
+    if not endpoint:
+        return jsonify({"error": "Missing endpoint"}), 400
+
+    with subs_lock:
+        subs = load_subscriptions()
+        new_subs = [s for s in subs if s.get("endpoint") != endpoint]
+        if len(new_subs) != len(subs):
+            save_subscriptions(new_subs)
+            print(f"[WEB PUSH] Usunięto subskrypcję (pozostało: {len(new_subs)})")
+
+    return jsonify({"status": "unsubscribed", "subscribed_devices": len(new_subs)}), 200
 
 
 @app.route("/api/status", methods=["GET"])
