@@ -16,11 +16,11 @@ GITHUB_ADMIN_VERSION_URL = f"{RAW_BASE_URL}/admin_version.txt"
 GITHUB_ADMIN_SCRIPT_URL = f"{RAW_BASE_URL}/admin.py"
 
 APP_DIR = "/opt/kasa-alarm"
+VENV_DIR = "/opt/kasa-alarm/venv"
 DATA_DIR = "/var/lib/kasa-alarm"
 SERVICE_NAME = "kasa-alarm.service"
 
-# Wersja awaryjna, jeśli plik admin_version.txt jeszcze nie istnieje na dysku
-FALLBACK_ADMIN_VERSION = "1.0.0"
+FALLBACK_ADMIN_VERSION = "1.0.1"
 # =============================================================
 
 
@@ -30,7 +30,6 @@ def run_cmd(cmd):
 
 
 def parse_version(v_str):
-    """Zamienia tekst np. '1.1.4' na krotkę (1, 1, 4) do porównania."""
     try:
         return tuple(int(x) for x in v_str.strip().split("."))
     except Exception:
@@ -38,7 +37,6 @@ def parse_version(v_str):
 
 
 def fetch_github_text(raw_url):
-    """Pobiera plik tekstowy z GitHuba z pominięciem pamięci podręcznej (cache)."""
     try:
         url = f"{raw_url}?t={int(time.time())}"
         req = urllib.request.Request(
@@ -57,7 +55,6 @@ def fetch_github_text(raw_url):
 
 
 def get_local_app_version():
-    """Odczytuje lokalną wersję programu głównego (version.txt)."""
     for path in [os.path.join(APP_DIR, "version.txt"), "version.txt"]:
         if os.path.exists(path):
             try:
@@ -69,7 +66,6 @@ def get_local_app_version():
 
 
 def get_local_admin_version():
-    """Odczytuje lokalną wersję panelu admina (admin_version.txt)."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     for path in [
         os.path.join(script_dir, "admin_version.txt"),
@@ -86,23 +82,30 @@ def get_local_admin_version():
 
 
 def option_1_install():
-    print("\n=== [1] INSTALACJA OPROGRAMOWANIA, WEB PUSH I USŁUGI SYSTEMD ===")
+    print("\n=== [1] INSTALACJA OPROGRAMOWANIA, VENV I USŁUGI SYSTEMD (v1.0.1) ===")
     run_cmd("apt-get update")
-    run_cmd("apt-get install -y git python3-pip python3-flask python3-gpiozero python3-requests python3-lgpio python3-cryptography network-manager")
-    run_cmd("pip3 install pywebpush py-vapid --break-system-packages")
+    run_cmd("apt-get install -y git python3-venv python3-pip python3-flask python3-gpiozero python3-requests python3-lgpio python3-cryptography network-manager")
 
     os.makedirs(DATA_DIR, exist_ok=True)
 
+    # Klonowanie lub aktualizacja kodu w /opt/kasa-alarm
     if not os.path.exists(os.path.join(APP_DIR, ".git")):
         print(f"Klonowanie repozytorium {GITHUB_REPO_URL} do {APP_DIR}...")
         shutil.rmtree(APP_DIR, ignore_errors=True)
         res = subprocess.run(f"git clone {GITHUB_REPO_URL} {APP_DIR}", shell=True)
         if res.returncode != 0:
-            print("Klonowanie nie powiodło się - kopiuję pliki lokalne do katalogu docelowego...")
             os.makedirs(APP_DIR, exist_ok=True)
-            for fname in ["app.py", "admin.py", "version.txt", "admin_version.txt"]:
+            for fname in ["app.py", "admin.py", "version.txt", "admin_version.txt", "changelog.txt"]:
                 if os.path.exists(fname):
                     shutil.copy2(fname, os.path.join(APP_DIR, fname))
+    else:
+        run_cmd(f"cd {APP_DIR} && git fetch --all && git reset --hard origin/main")
+
+    # Tworzenie venv z dostępem do pakietów systemowych (lgpio, flask, gpiozero)
+    print("\nTworzenie środowiska wirtualnego venv (--system-site-packages)...")
+    shutil.rmtree(VENV_DIR, ignore_errors=True)
+    run_cmd(f"python3 -m venv --system-site-packages {VENV_DIR}")
+    run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid")
 
     service_content = f"""[Unit]
 Description=System Czujnika Ruchu i Przycisku Pomocy przy Kasie (detektor)
@@ -113,7 +116,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory={APP_DIR}
-ExecStart=/usr/bin/python3 {APP_DIR}/app.py
+ExecStart={VENV_DIR}/bin/python {APP_DIR}/app.py
 Restart=always
 RestartSec=5
 
@@ -126,9 +129,8 @@ WantedBy=multi-user.target
     run_cmd("systemctl daemon-reload")
     run_cmd(f"systemctl enable {SERVICE_NAME}")
     run_cmd(f"systemctl restart {SERVICE_NAME}")
-    time.sleep(2)
-    option_7_show_vapid()
-    print("\n[OK] Instalacja zakończona! Czujnik działa w tle i włączy się sam po każdym zaniku prądu.")
+    time.sleep(3)
+    option_8_diagnostics()
 
 
 def option_2_update_app():
@@ -154,6 +156,8 @@ def option_2_update_app():
             run_cmd(f"cd {APP_DIR} && git fetch --all && git reset --hard origin/main")
         else:
             run_cmd(f"rm -rf {APP_DIR} && git clone {GITHUB_REPO_URL} {APP_DIR}")
+            run_cmd(f"python3 -m venv --system-site-packages {VENV_DIR}")
+            run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid")
         run_cmd(f"systemctl restart {SERVICE_NAME}")
         print(f"\n[OK] Zaktualizowano program czujnika do wersji {get_local_app_version()} i zrestartowano usługę!")
 
@@ -185,13 +189,11 @@ def option_3_update_admin():
         current_script_path = os.path.abspath(__file__)
         current_script_dir = os.path.dirname(current_script_path)
 
-        # Zapis nowego admin.py i admin_version.txt w bieżącej lokalizacji
         with open(current_script_path, "w", encoding="utf-8") as f:
             f.write(new_admin_code + "\n")
         with open(os.path.join(current_script_dir, "admin_version.txt"), "w", encoding="utf-8") as f:
             f.write(remote_admin_ver + "\n")
 
-        # Jeśli istnieje katalog /opt/kasa-alarm, aktualizujemy również tamtą kopię
         if os.path.exists(APP_DIR):
             with open(os.path.join(APP_DIR, "admin.py"), "w", encoding="utf-8") as f:
                 f.write(new_admin_code + "\n")
@@ -250,7 +252,7 @@ def option_7_show_vapid():
             keys = json.load(f)
         print(f"Application Server Key (Public Key):\n\n{keys.get('publicKey')}\n")
     else:
-        print("[!] Klucze VAPID nie zostały jeszcze wygenerowane (uruchom opcję 1).")
+        print("[!] Klucze VAPID nie zostały jeszcze wygenerowane (serwer app.py jeszcze nie wystartował).")
 
     if os.path.exists(subs_path):
         with open(subs_path, "r", encoding="utf-8") as f:
@@ -260,6 +262,14 @@ def option_7_show_vapid():
         print("Zarejestrowane telefony pracowników: 0")
 
 
+def option_8_diagnostics():
+    print("\n=== [8] DIAGNOSTYKA SERWERA I LOGI BŁĘDÓW ===")
+    run_cmd("hostname -I")
+    run_cmd("curl -i http://localhost:5000/api/status")
+    print("\n--- Ostatnie 20 linii logów usługi kasa-alarm.service ---")
+    run_cmd(f"journalctl -u {SERVICE_NAME} -n 20 --no-pager")
+
+
 def main():
     if os.geteuid() != 0:
         print("[!] Uruchom ten skrypt z uprawnieniami administratora:")
@@ -267,9 +277,9 @@ def main():
         sys.exit(1)
 
     while True:
-        print("\n" + "=" * 64)
+        print("\n" + "=" * 66)
         print(f" PANEL ADMINISTRATORA v{get_local_admin_version()} | Program czujnika: v{get_local_app_version()}")
-        print("=" * 64)
+        print("=" * 66)
         print("1. Zainstaluj oprogramowanie i Web Push (pierwszy start / po awarii)")
         print("2. Zaktualizuj program czujnika z GitHuba (sprawdź version.txt)")
         print("3. Zaktualizuj ten Panel Administratora (sprawdź admin_version.txt)")
@@ -277,10 +287,11 @@ def main():
         print("5. Aktualizuj system operacyjny (apt update & upgrade)")
         print("6. Uruchom ponownie czujnik / malinkę (reboot)")
         print("7. Pokaż klucz VAPID i liczbę zapisanych telefonów")
+        print("8. Diagnostyka serwera i podgląd logów błędów")
         print("0. Wyjdź")
-        print("-" * 64)
+        print("-" * 66)
 
-        choice = input("Wybierz opcję [0-7]: ").strip()
+        choice = input("Wybierz opcję [0-8]: ").strip()
         if choice == "1":
             option_1_install()
         elif choice == "2":
@@ -295,6 +306,8 @@ def main():
             option_6_reboot()
         elif choice == "7":
             option_7_show_vapid()
+        elif choice == "8":
+            option_8_diagnostics()
         elif choice == "0":
             print("Do zobaczenia!")
             break
