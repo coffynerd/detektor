@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import os
+import re
 import time
 import json
 import base64
 import threading
 import subprocess
 import urllib.request
+import requests
 from flask import Flask, jsonify, request
 from gpiozero import MotionSensor, Button
 from pywebpush import webpush, WebPushException
@@ -39,6 +41,8 @@ SERVICE_NAME = "kasa-alarm.service"
 DATA_DIR = "/var/lib/kasa-alarm"
 SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "push_subscriptions.json")
 VAPID_KEYS_FILE = os.path.join(DATA_DIR, "vapid_keys.json")
+PUBLIC_URL_FILE = os.path.join(DATA_DIR, "public_url.txt")
+CLOUD_CONFIG_FILE = os.path.join(DATA_DIR, "cloud_config.json")
 VAPID_CLAIMS = {"sub": "mailto:admin@twojadomena.pl"}
 # =========================================================================
 
@@ -61,7 +65,9 @@ cooldown_timer = None
 @app.after_request
 def add_cors_and_pna_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, ngrok-skip-browser-warning, Bypass-Tunnel-Reminder"
+    )
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Private-Network"] = "true"
     return response
@@ -79,7 +85,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.3"
+        return "1.0.4"
 
 
 def get_local_changelog():
@@ -88,6 +94,27 @@ def get_local_changelog():
             return f.read().strip()
     except Exception:
         return "Brak opisu zmian."
+
+
+def get_public_tunnel_url():
+    """Odczytuje aktualny publiczny adres HTTPS wygenerowany przez usługę tunelu."""
+    try:
+        if os.path.exists(PUBLIC_URL_FILE):
+            with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def load_cloud_config():
+    try:
+        if os.path.exists(CLOUD_CONFIG_FILE):
+            with open(CLOUD_CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"firebase_db_url": ""}
 
 
 def fetch_github_text(raw_url):
@@ -216,7 +243,7 @@ def finish_arming():
         if system_state == "ARMING":
             motion_timestamps.clear()
             system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (v1.0.3).")
+            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (v1.0.4).")
 
 
 def reset_cooldown():
@@ -283,13 +310,6 @@ def register_motion_hit():
             cooldown_timer.start()
 
 
-def motion_monitor_loop():
-    while True:
-        time.sleep(0.5)
-        if system_state == "ARMED" and not cooldown_active and pir.motion_detected:
-            register_motion_hit()
-
-
 def trigger_help_request():
     global alert_type, responder_name
     with state_lock:
@@ -303,6 +323,84 @@ def trigger_help_request():
         )
 
 
+def handle_ack_action(worker_name):
+    global responder_name, cooldown_active, cooldown_timer
+    worker = (worker_name or "Pracownik").strip() or "Pracownik"
+    with state_lock:
+        if alert_type != "NONE" and not responder_name:
+            responder_name = worker
+            if cooldown_timer is not None:
+                cooldown_timer.cancel()
+            cooldown_active = True
+            motion_timestamps.clear()
+            cooldown_timer = threading.Timer(ACK_PAUSE_SEC, reset_cooldown)
+            cooldown_timer.start()
+            send_push_to_all(
+                "✅ Kasa obsłużona",
+                f"{worker} już idzie do kasy!",
+                "ACK"
+            )
+
+
+def motion_monitor_loop():
+    while True:
+        time.sleep(0.5)
+        if system_state == "ARMED" and not cooldown_active and pir.motion_detected:
+            register_motion_hit()
+
+
+def firebase_relay_loop():
+    """
+    Opcjonalny wątek pośredniczący (Firebase Realtime Database Relay).
+    Pozwala na komunikację dwukierunkową spoza sieci Wi-Fi bez konieczności używania tunelu.
+    """
+    while True:
+        time.sleep(2.0)
+        cfg = load_cloud_config()
+        db_url = cfg.get("firebase_db_url", "").strip().rstrip("/")
+        if not db_url:
+            continue
+
+        try:
+            now = time.time()
+            with state_lock:
+                active_hits = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
+                status_payload = {
+                    "system_state": system_state,
+                    "alert_type": alert_type,
+                    "responder_name": responder_name,
+                    "motion_hits": len(active_hits),
+                    "motion_required": MOTION_REQUIRED_HITS,
+                    "version": get_local_version(),
+                    "subscribed_devices": len(load_subscriptions()),
+                    "public_url": get_public_tunnel_url(),
+                    "last_updated": int(now * 1000)
+                }
+
+            # Wysyłka aktualnego stanu malinki do chmury
+            requests.put(f"{db_url}/kasa_relay/status.json", json=status_payload, timeout=3)
+
+            # Sprawdzenie, czy pracownik spoza Wi-Fi wysłał komendę (ACK / HELP / CLEAR)
+            cmd_res = requests.get(f"{db_url}/kasa_relay/command.json", timeout=3)
+            if cmd_res.status_code == 200 and cmd_res.json():
+                cmd_data = cmd_res.json()
+                action = cmd_data.get("action")
+                if action == "ACK":
+                    handle_ack_action(cmd_data.get("name", "Pracownik"))
+                elif action == "HELP":
+                    trigger_help_request()
+                elif action == "CLEAR":
+                    with state_lock:
+                        global alert_type, responder_name
+                        alert_type = "NONE"
+                        responder_name = ""
+                        motion_timestamps.clear()
+                # Po wykonaniu komendy czyścimy kolejkę w chmurze
+                requests.delete(f"{db_url}/kasa_relay/command.json", timeout=3)
+        except Exception as e:
+            print(f"[FIREBASE RELAY WARN] {e}")
+
+
 switch.when_pressed = on_switch_on
 switch.when_released = on_switch_off
 pir.when_motion = register_motion_hit
@@ -312,7 +410,10 @@ if switch.is_pressed:
     on_switch_on()
 
 threading.Thread(target=motion_monitor_loop, daemon=True).start()
+threading.Thread(target=firebase_relay_loop, daemon=True).start()
 
+
+# ================= ENDPOINTY REST API =================
 
 @app.route("/api/vapid-public-key", methods=["GET"])
 def get_vapid_public_key():
@@ -349,7 +450,8 @@ def api_status():
             "motion_hits": len(active_hits),
             "motion_required": MOTION_REQUIRED_HITS,
             "version": get_local_version(),
-            "subscribed_devices": len(load_subscriptions())
+            "subscribed_devices": len(load_subscriptions()),
+            "public_url": get_public_tunnel_url()
         })
 
 
@@ -358,24 +460,8 @@ def api_ack():
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
 
-    global responder_name, cooldown_active, cooldown_timer
     data = request.get_json(silent=True) or {}
-    worker = data.get("name", "Pracownik").strip() or "Pracownik"
-
-    with state_lock:
-        if alert_type != "NONE" and not responder_name:
-            responder_name = worker
-            if cooldown_timer is not None:
-                cooldown_timer.cancel()
-            cooldown_active = True
-            motion_timestamps.clear()
-            cooldown_timer = threading.Timer(ACK_PAUSE_SEC, reset_cooldown)
-            cooldown_timer.start()
-            send_push_to_all(
-                "✅ Kasa obsłużona",
-                f"{worker} już idzie do kasy!",
-                "ACK"
-            )
+    handle_ack_action(data.get("name", "Pracownik"))
     return jsonify({"ok": True})
 
 
@@ -461,7 +547,8 @@ def index():
     return jsonify({
         "service": "Detektor Kasa API (coffynerd/detektor)",
         "version": get_local_version(),
-        "status": "online"
+        "status": "online",
+        "public_url": get_public_tunnel_url()
     })
 
 
