@@ -1,2 +1,4 @@
-Wersja 1.0.3:
-- Przeniesiono zależności Web Push do środowiska wirtualnego Python venv (całkowita odporność na błędy cryptography w Debianie)
+Wersja 1.0.4:
+- Dodano obsługę połączeń spoza sieci Wi-Fi (automatyczny tunel HTTPS oraz synchronizacja Firebase Relay)
+- Rozbudowano nagłówki CORS o obsługę tuneli publicznych (LTE/5G)
+- Dodano zwracanie aktywnego adresu publicznego (public_url) bezpośrednio w /api/status
