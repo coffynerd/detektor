@@ -25,7 +25,7 @@ CLOUD_CONFIG_FILE = os.path.join(DATA_DIR, "cloud_config.json")
 SERVICE_NAME = "kasa-alarm.service"
 TUNNEL_SERVICE_NAME = "kasa-tunnel.service"
 
-FALLBACK_ADMIN_VERSION = "1.0.2"
+FALLBACK_ADMIN_VERSION = "1.0.3"
 # =============================================================
 
 
@@ -119,7 +119,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory={APP_DIR}
-ExecStart={VENV_DIR}/bin/python {APP_DIR}/app.py
+ExecStart={VENV_DIR}/bin/python -u {APP_DIR}/app.py
 Restart=always
 RestartSec=5
 
@@ -289,7 +289,6 @@ def option_9_tunnel():
 
     if sub == "a":
         os.makedirs(DATA_DIR, exist_ok=True)
-        # Generujemy klucz SSH dla root, jeśli jeszcze nie istnieje (wymagane przez localhost.run)
         ssh_key_path = "/root/.ssh/id_ed25519"
         if not os.path.exists(ssh_key_path):
             os.makedirs("/root/.ssh", exist_ok=True)
@@ -313,7 +312,8 @@ while True:
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True
+        text=True,
+        bufsize=1
     )
     for line in proc.stdout:
         print(line, end="", flush=True)
@@ -337,7 +337,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/python3 {tunnel_runner}
+ExecStart=/usr/bin/python3 -u {tunnel_runner}
 Restart=always
 RestartSec=5
 
@@ -354,7 +354,7 @@ WantedBy=multi-user.target
         time.sleep(5)
         if os.path.exists(PUBLIC_URL_FILE):
             with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
-                print(f"\n[OK] Twój publiczny adres HTTPS (wpisz w 2. polu w Panelu Admina):\n>>> {f.read().strip()} <<<\n")
+                print(f"\n[OK] Twój publiczny adres HTTPS:\n>>> {f.read().strip()} <<<\n")
         else:
             print("[i] Tunel startuje w tle. Wybierz za chwilę opcję 9 -> b, aby odczytać adres.")
 
