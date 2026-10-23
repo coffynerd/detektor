@@ -61,6 +61,11 @@ last_sample_time = 0.0
 arm_timer = None
 cooldown_timer = None
 
+# Cache danych o aktualizacji z GitHuba dla pośrednika Firebase
+cached_remote_version = ""
+cached_remote_changelog = ""
+last_github_check_ts = 0.0
+
 
 @app.after_request
 def add_cors_and_pna_headers(response):
@@ -85,7 +90,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.4"
+        return "1.0.5"
 
 
 def get_local_changelog():
@@ -97,7 +102,6 @@ def get_local_changelog():
 
 
 def get_public_tunnel_url():
-    """Odczytuje aktualny publiczny adres HTTPS wygenerowany przez usługę tunelu."""
     try:
         if os.path.exists(PUBLIC_URL_FILE):
             with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
@@ -133,6 +137,40 @@ def fetch_github_text(raw_url):
     except Exception as e:
         print(f"[GITHUB FETCH ERROR] {raw_url}: {e}")
         return None
+
+
+def refresh_github_info(force=False):
+    global cached_remote_version, cached_remote_changelog, last_github_check_ts
+    now = time.time()
+    if not force and cached_remote_version and (now - last_github_check_ts < 300):
+        return cached_remote_version, cached_remote_changelog
+
+    rem_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
+    rem_log = fetch_github_text(GITHUB_RAW_CHANGELOG_URL)
+    if rem_ver:
+        cached_remote_version = rem_ver
+    if rem_log:
+        cached_remote_changelog = rem_log
+    last_github_check_ts = now
+    return cached_remote_version, cached_remote_changelog
+
+
+def perform_self_update():
+    if os.path.exists(os.path.join(BASE_DIR, ".git")):
+        cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
+    else:
+        cmd = f"rm -rf {BASE_DIR} && git clone {GITHUB_REPO_URL} {BASE_DIR}"
+
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if res.returncode != 0:
+        return False, res.stderr
+
+    def _restart_service():
+        time.sleep(1.5)
+        subprocess.run(f"systemctl restart {SERVICE_NAME}", shell=True)
+
+    threading.Thread(target=_restart_service, daemon=True).start()
+    return True, get_local_version()
 
 
 def init_vapid_keys():
@@ -180,6 +218,30 @@ def save_subscriptions(subs):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(subs, f, indent=2)
+
+
+def add_subscription_entry(sub):
+    if not sub or "endpoint" not in sub:
+        return len(load_subscriptions())
+    with subs_lock:
+        subs = load_subscriptions()
+        if not any(s.get("endpoint") == sub["endpoint"] for s in subs):
+            subs.append(sub)
+            save_subscriptions(subs)
+            print(f"[WEB PUSH] Dodano subskrypcję (łącznie: {len(subs)})")
+        return len(subs)
+
+
+def remove_subscription_entry(endpoint):
+    if not endpoint:
+        return len(load_subscriptions())
+    with subs_lock:
+        subs = load_subscriptions()
+        new_subs = [s for s in subs if s.get("endpoint") != endpoint]
+        if len(new_subs) != len(subs):
+            save_subscriptions(new_subs)
+            print(f"[WEB PUSH] Usunięto subskrypcję (pozostało: {len(new_subs)})")
+        return len(new_subs)
 
 
 def send_push_to_all(title, body, push_alert_type="MOTION"):
@@ -243,7 +305,7 @@ def finish_arming():
         if system_state == "ARMING":
             motion_timestamps.clear()
             system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (v1.0.4).")
+            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (v1.0.5).")
 
 
 def reset_cooldown():
@@ -351,9 +413,10 @@ def motion_monitor_loop():
 
 def firebase_relay_loop():
     """
-    Opcjonalny wątek pośredniczący (Firebase Realtime Database Relay).
-    Pozwala na komunikację dwukierunkową spoza sieci Wi-Fi bez konieczności używania tunelu.
+    Niezawodny wątek pośredniczący (Firebase Realtime Database Relay).
+    Synchronizuje stan, klucz VAPID, subskrypcje oraz aktualizacje przez chmurę.
     """
+    session = requests.Session()
     while True:
         time.sleep(2.0)
         cfg = load_cloud_config()
@@ -362,7 +425,10 @@ def firebase_relay_loop():
             continue
 
         try:
+            rem_ver, rem_log = refresh_github_info(force=False)
+            loc_ver = get_local_version()
             now = time.time()
+
             with state_lock:
                 active_hits = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
                 status_payload = {
@@ -371,31 +437,52 @@ def firebase_relay_loop():
                     "responder_name": responder_name,
                     "motion_hits": len(active_hits),
                     "motion_required": MOTION_REQUIRED_HITS,
-                    "version": get_local_version(),
+                    "version": loc_ver,
+                    "remote_version": rem_ver or loc_ver,
+                    "update_available": parse_version(rem_ver) > parse_version(loc_ver) if rem_ver else False,
+                    "changelog": rem_log or get_local_changelog(),
                     "subscribed_devices": len(load_subscriptions()),
+                    "vapid_public_key": VAPID_PUBLIC_KEY,
                     "public_url": get_public_tunnel_url(),
                     "last_updated": int(now * 1000)
                 }
 
-            requests.put(f"{db_url}/kasa_relay/status.json", json=status_payload, timeout=3)
+            session.put(f"{db_url}/kasa_relay/status.json", json=status_payload, timeout=(2.5, 4.0))
 
-            cmd_res = requests.get(f"{db_url}/kasa_relay/command.json", timeout=3)
-            if cmd_res.status_code == 200 and cmd_res.json():
+            cmd_res = session.get(f"{db_url}/kasa_relay/command.json", timeout=(2.5, 4.0))
+            if cmd_res.status_code == 200:
                 cmd_data = cmd_res.json()
-                action = cmd_data.get("action")
-                if action == "ACK":
-                    handle_ack_action(cmd_data.get("name", "Pracownik"))
-                elif action == "HELP":
-                    trigger_help_request()
-                elif action == "CLEAR":
-                    with state_lock:
-                        global alert_type, responder_name
-                        alert_type = "NONE"
-                        responder_name = ""
-                        motion_timestamps.clear()
-                requests.delete(f"{db_url}/kasa_relay/command.json", timeout=3)
+                if isinstance(cmd_data, dict) and cmd_data.get("action"):
+                    action = cmd_data.get("action")
+                    # Najpierw usuwamy komendę z kolejki, aby nie wykonała się podwójnie
+                    session.delete(f"{db_url}/kasa_relay/command.json", timeout=(2.5, 4.0))
+
+                    if action == "ACK":
+                        handle_ack_action(cmd_data.get("name", "Pracownik"))
+                    elif action == "HELP":
+                        trigger_help_request()
+                    elif action == "CLEAR":
+                        with state_lock:
+                            global alert_type, responder_name
+                            alert_type = "NONE"
+                            responder_name = ""
+                            motion_timestamps.clear()
+                    elif action == "SUBSCRIBE":
+                        add_subscription_entry(cmd_data.get("subscription"))
+                    elif action == "UNSUBSCRIBE":
+                        remove_subscription_entry(cmd_data.get("endpoint"))
+                    elif action == "UPDATE_CHECK":
+                        refresh_github_info(force=True)
+                    elif action == "UPDATE_RUN":
+                        perform_self_update()
+
         except Exception as e:
             print(f"[FIREBASE RELAY WARN] {e}")
+            try:
+                session.close()
+            except Exception:
+                pass
+            session = requests.Session()
 
 
 switch.when_pressed = on_switch_on
@@ -426,19 +513,12 @@ def subscribe_push():
     if not sub or "endpoint" not in sub:
         return jsonify({"error": "Invalid subscription"}), 400
 
-    with subs_lock:
-        subs = load_subscriptions()
-        if not any(s.get("endpoint") == sub["endpoint"] for s in subs):
-            subs.append(sub)
-            save_subscriptions(subs)
-            print(f"[WEB PUSH] Dodano subskrypcję (łącznie: {len(subs)})")
-
-    return jsonify({"status": "subscribed", "subscribed_devices": len(subs)}), 201
+    total = add_subscription_entry(sub)
+    return jsonify({"status": "subscribed", "subscribed_devices": total}), 201
 
 
 @app.route("/api/unsubscribe", methods=["POST", "OPTIONS"])
 def unsubscribe_push():
-    """Natychmiastowo usuwa subskrypcję telefonu po kliknięciu wyłączenia powiadomień."""
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
 
@@ -447,14 +527,8 @@ def unsubscribe_push():
     if not endpoint:
         return jsonify({"error": "Missing endpoint"}), 400
 
-    with subs_lock:
-        subs = load_subscriptions()
-        new_subs = [s for s in subs if s.get("endpoint") != endpoint]
-        if len(new_subs) != len(subs):
-            save_subscriptions(new_subs)
-            print(f"[WEB PUSH] Usunięto subskrypcję (pozostało: {len(new_subs)})")
-
-    return jsonify({"status": "unsubscribed", "subscribed_devices": len(new_subs)}), 200
+    total = remove_subscription_entry(endpoint)
+    return jsonify({"status": "unsubscribed", "subscribed_devices": total}), 200
 
 
 @app.route("/api/status", methods=["GET"])
@@ -470,6 +544,7 @@ def api_status():
             "motion_required": MOTION_REQUIRED_HITS,
             "version": get_local_version(),
             "subscribed_devices": len(load_subscriptions()),
+            "vapid_public_key": VAPID_PUBLIC_KEY,
             "public_url": get_public_tunnel_url()
         })
 
@@ -508,8 +583,7 @@ def api_clear():
 @app.route("/api/update-check", methods=["GET"])
 def api_update_check():
     local_ver = get_local_version()
-    remote_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
-    remote_changelog = fetch_github_text(GITHUB_RAW_CHANGELOG_URL)
+    remote_ver, remote_changelog = refresh_github_info(force=True)
 
     if not remote_ver:
         return jsonify({
@@ -534,27 +608,14 @@ def api_update_run():
         return jsonify({"ok": True}), 200
 
     try:
-        if os.path.exists(os.path.join(BASE_DIR, ".git")):
-            cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
-        else:
-            cmd = f"rm -rf {BASE_DIR} && git clone {GITHUB_REPO_URL} {BASE_DIR}"
-
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-        if res.returncode != 0:
-            return jsonify({"ok": False, "error": res.stderr}), 500
-
-        new_ver = get_local_version()
-
-        def _restart_service():
-            time.sleep(1.5)
-            subprocess.run(f"systemctl restart {SERVICE_NAME}", shell=True)
-
-        threading.Thread(target=_restart_service, daemon=True).start()
+        ok, info = perform_self_update()
+        if not ok:
+            return jsonify({"ok": False, "error": info}), 500
 
         return jsonify({
             "ok": True,
             "status": "restarting",
-            "new_version": new_ver,
+            "new_version": info,
             "changelog": get_local_changelog()
         })
     except Exception as e:
