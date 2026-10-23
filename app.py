@@ -6,26 +6,28 @@ import base64
 import threading
 import subprocess
 import urllib.request
+from collections import deque
 from flask import Flask, jsonify, request
 from gpiozero import MotionSensor, Button
 from pywebpush import webpush, WebPushException
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 
-# ================= KONFIGURACJA SPRZĘTOWA I FILTRU RUCHU =================
+# ================= KONFIGURACJA SPRZĘTOWA I DETEKCJI (v1.0.11) =================
 PIR_PIN = 17        # Pin fizyczny 11 - Czujnik ruchu DFRobot SEN0171
 SWITCH_PIN = 27     # Pin fizyczny 13 - Przełącznik ON/OFF (bistabilny)
 HELP_BTN_PIN = 22   # Pin fizyczny 15 - Rezerwacja pod fizyczny przycisk "Wezwij pomoc"
 
-# ================= PARAMETRY CZUJNIKA (ODPORNE NA PRZECIĄGI I ZAKŁÓCENIA) =================
-ARM_DELAY_SEC = 10            # 10 sekund na odejście i uspokojenie zasilania po przełączeniu
-COOLDOWN_SEC = 60             # Przerwa między kolejnymi alarmami (60s)
-ACK_PAUSE_SEC = 120           # Wyciszenie po kliknięciu "Idę do kasy" (120s)
+ARM_DELAY_SEC = 8           # Czas na odejście od kasy po włączeniu przełącznika (8 sekund)
+COOLDOWN_SEC = 60           # Przerwa między kolejnymi powiadomieniami z czujnika (60 sekund)
+ACK_PAUSE_SEC = 120         # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
 
-MOTION_WINDOW_SEC = 25.0      # Okno czasowe pamiętania próbek (25 sekund)
-MOTION_REQUIRED_HITS = 3      # Wymagane 3 niezależne potwierdzenia
-MOTION_SAMPLE_INTERVAL = 4.5  # MUSI wynosić min. 4.5s (więcej niż 3s podtrzymania czujnika!)
-MIN_SUSTAIN_SEC = 0.8         # Sygnał musi trwać ciągle min. 0.8s (odrzuca zakłócenia z metalowej kasy)
+# Nowy algorytm Sliding Presence (rozwiązuje problem nieruchomych klientów i szumu z kabla):
+SAMPLE_TICK_SEC = 0.25          # Częstotliwość próbkowania czujnika (co 0.25 sekundy)
+MIN_GLITCH_TICKS = 2            # Min. 2 ciągłe próbki (0.5s), aby odrzucić szpilki napięcia z zasilania RPi0
+MOTION_WINDOW_SEC = 14.0        # Okno czasowe analizy obecności klienta (14 sekund)
+REQUIRED_ACTIVE_SEC = 3.5       # Wymagany łączny czas sygnału PIR w oknie (3.5s = podejście + drobny ruch)
+MOTION_REQUIRED_HITS = 3        # Skala prezentacji postępu na pasku w UI (0/3 .. 3/3)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = os.path.join(BASE_DIR, "version.txt")
@@ -43,7 +45,7 @@ VAPID_KEYS_FILE = os.path.join(DATA_DIR, "vapid_keys.json")
 PUBLIC_URL_FILE = os.path.join(DATA_DIR, "public_url.txt")
 CLOUD_CONFIG_FILE = os.path.join(DATA_DIR, "cloud_config.json")
 VAPID_CLAIMS = {"sub": "mailto:admin@twojadomena.pl"}
-# =========================================================================
+# ===============================================================================
 
 app = Flask(__name__)
 state_lock = threading.Lock()
@@ -54,11 +56,16 @@ alert_type = "NONE"         # NONE | MOTION | HELP
 responder_name = ""
 cooldown_active = False
 
-motion_timestamps = []
-last_sample_time = 0.0
+# Bufor ostatnich potwierdzonych próbek aktywności (znaczniki czasu)
+active_samples = deque()
+waiting_for_sensor_quiet = False
 
 arm_timer = None
 cooldown_timer = None
+
+cached_remote_version = ""
+cached_remote_changelog = ""
+last_github_check_ts = 0.0
 
 
 @app.after_request
@@ -84,7 +91,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.10"
+        return "1.0.11"
 
 
 def get_local_changelog():
@@ -145,6 +152,40 @@ def fetch_github_text(raw_url):
     except Exception as e:
         print(f"[GITHUB FETCH ERROR] {raw_url}: {e}")
         return None
+
+
+def refresh_github_info(force=False):
+    global cached_remote_version, cached_remote_changelog, last_github_check_ts
+    now = time.time()
+    if not force and cached_remote_version and (now - last_github_check_ts < 300):
+        return cached_remote_version, cached_remote_changelog
+
+    rem_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
+    rem_log = fetch_github_text(GITHUB_RAW_CHANGELOG_URL)
+    if rem_ver:
+        cached_remote_version = rem_ver
+    if rem_log:
+        cached_remote_changelog = rem_log
+    last_github_check_ts = now
+    return cached_remote_version, cached_remote_changelog
+
+
+def perform_self_update():
+    if os.path.exists(os.path.join(BASE_DIR, ".git")):
+        cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
+    else:
+        cmd = f"rm -rf {BASE_DIR} && git clone {GITHUB_REPO_URL} {BASE_DIR}"
+
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if res.returncode != 0:
+        return False, res.stderr
+
+    def _restart_service():
+        time.sleep(1.5)
+        subprocess.run(f"systemctl restart {SERVICE_NAME}", shell=True)
+
+    threading.Thread(target=_restart_service, daemon=True).start()
+    return True, get_local_version()
 
 
 def http_json_request(method, url, payload=None, timeout=3.0):
@@ -272,8 +313,19 @@ switch = Button(SWITCH_PIN, pull_up=True, bounce_time=0.1)
 help_button = Button(HELP_BTN_PIN, pull_up=True, bounce_time=0.1)
 
 
+def get_current_hits_locked(now=None):
+    """Przelicza zgromadzony czas sygnału w oknie na skalę 0..3 dla interfejsu."""
+    if now is None:
+        now = time.time()
+    while active_samples and (now - active_samples[0] > MOTION_WINDOW_SEC):
+        active_samples.popleft()
+    active_sec = len(active_samples) * SAMPLE_TICK_SEC
+    ratio = min(1.0, active_sec / REQUIRED_ACTIVE_SEC)
+    return int(round(ratio * MOTION_REQUIRED_HITS))
+
+
 def cancel_timers():
-    global arm_timer, cooldown_timer, cooldown_active, motion_timestamps
+    global arm_timer, cooldown_timer, cooldown_active, waiting_for_sensor_quiet
     if arm_timer is not None:
         arm_timer.cancel()
         arm_timer = None
@@ -281,30 +333,29 @@ def cancel_timers():
         cooldown_timer.cancel()
         cooldown_timer = None
     cooldown_active = False
-    motion_timestamps.clear()
+    waiting_for_sensor_quiet = False
+    active_samples.clear()
 
 
 def finish_arming():
-    global system_state, motion_timestamps, last_sample_time
+    global system_state, waiting_for_sensor_quiet
     with state_lock:
         if system_state == "ARMING":
-            motion_timestamps.clear()
-            # Blokujemy próbkowanie na 3s po uzbrojeniu, jeśli czujnik jeszcze widzi odchodzącego kasjera
-            last_sample_time = time.time()
+            active_samples.clear()
+            waiting_for_sensor_quiet = True
             system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu.")
+            print("[SYSTEM] Uzbrojono (v1.0.11) - oczekiwanie na stan spoczynku czujnika PIR...")
 
 
-def finish_arming():
-    global system_state, motion_timestamps, last_sample_time
+def reset_cooldown():
+    global cooldown_active, alert_type, responder_name, waiting_for_sensor_quiet
     with state_lock:
-        if system_state == "ARMING":
-            motion_timestamps.clear()
-            # Ustawiamy last_sample_time na "teraz", dzięki czemu przez pierwsze 4.5s
-            # po uzbrojeniu zignorujemy ewentualny impuls startowy czujnika
-            last_sample_time = time.time()
-            system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu.")
+        cooldown_active = False
+        active_samples.clear()
+        waiting_for_sensor_quiet = True
+        if alert_type == "MOTION":
+            alert_type = "NONE"
+            responder_name = ""
 
 
 def on_switch_on():
@@ -328,38 +379,6 @@ def on_switch_off():
         print("[SYSTEM] Wyłączono przełącznik - system rozbrojony natychmiast.")
 
 
-def register_motion_hit():
-    global alert_type, responder_name, cooldown_active, cooldown_timer, motion_timestamps, last_sample_time
-    now = time.time()
-
-    with state_lock:
-        if system_state != "ARMED" or cooldown_active:
-            return
-
-        if now - last_sample_time < MOTION_SAMPLE_INTERVAL:
-            return
-
-        last_sample_time = now
-        motion_timestamps = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
-        motion_timestamps.append(now)
-
-        hits = len(motion_timestamps)
-        print(f"[DETEKTOR] Potwierdzony sygnał przy kasie ({hits}/{MOTION_REQUIRED_HITS})")
-
-        if hits >= MOTION_REQUIRED_HITS:
-            motion_timestamps.clear()
-            alert_type = "MOTION"
-            responder_name = ""
-            cooldown_active = True
-            print("[ALARM] Potwierdzono obecność klienta przy kasie! Wysyłam powiadomienia.")
-            send_push_to_all(
-                "🚨 Klient czeka przy kasie!",
-                "Wykryto stałą obecność przy pustej kasie. Kliknij, aby przyjąć.",
-                "MOTION"
-            )
-            cooldown_timer = threading.Timer(COOLDOWN_SEC, reset_cooldown)
-            cooldown_timer.start()
-
 def trigger_help_request():
     global alert_type, responder_name
     with state_lock:
@@ -382,7 +401,7 @@ def handle_ack_action(worker_name):
             if cooldown_timer is not None:
                 cooldown_timer.cancel()
             cooldown_active = True
-            motion_timestamps.clear()
+            active_samples.clear()
             cooldown_timer = threading.Timer(ACK_PAUSE_SEC, reset_cooldown)
             cooldown_timer.start()
             send_push_to_all(
@@ -393,30 +412,91 @@ def handle_ack_action(worker_name):
 
 
 def handle_clear_action():
-    global alert_type, responder_name, motion_timestamps
+    global alert_type, responder_name
     with state_lock:
         alert_type = "NONE"
         responder_name = ""
-        motion_timestamps.clear()
+        active_samples.clear()
 
 
 def motion_monitor_loop():
     """
-    Sprawdza nie tylko sam impuls, ale wymaga, aby stan wysoki utrzymał się
-    nieprzerwanie przez MIN_SUSTAIN_SEC (0.8s), co eliminuje zakłócenia z metalowej kasy.
+    Pętla analizy sygnału PIR (Sliding Presence Window v1.0.11):
+    - Ignoruje pojedyncze szpilki napięcia (<0.5s) z linii zasilania RPi0.
+    - Po uzbrojeniu czeka, aż czujnik opadnie do zera przez pełną sekundę (brak samowzbudzenia po starcie).
+    - Sumuje realny czas obecności w oknie 14s, wykrywając także osoby stojące spokojnie.
     """
+    global alert_type, responder_name, cooldown_active, cooldown_timer, waiting_for_sensor_quiet
+
+    consecutive_high = 0
+    consecutive_low = 0
+    last_logged_hits = 0
+
     while True:
-        time.sleep(0.2)
-        if system_state == "ARMED" and not cooldown_active and pir.motion_detected:
-            # Sprawdzamy, czy sygnał utrzymuje się nieprzerwanie przez 0.8 sekundy
-            sustained = True
-            for _ in range(4):
-                time.sleep(MIN_SUSTAIN_SEC / 4.0)
-                if not pir.motion_detected or system_state != "ARMED":
-                    sustained = False
-                    break
-            if sustained:
-                register_motion_hit()
+        time.sleep(SAMPLE_TICK_SEC)
+        is_high = pir.motion_detected
+
+        with state_lock:
+            if system_state != "ARMED" or cooldown_active:
+                consecutive_high = 0
+                consecutive_low = 0
+                last_logged_hits = 0
+                continue
+
+            # Po uzbrojeniu czekamy, aż czujnik całkowicie się uspokoi (1s stanu LOW)
+            if waiting_for_sensor_quiet:
+                if not is_high:
+                    consecutive_low += 1
+                    if consecutive_low >= 4:  # 4 * 0.25s = 1.0s ciszy
+                        waiting_for_sensor_quiet = False
+                        consecutive_high = 0
+                        print("[SYSTEM] Czujnik PIR skalibrowany (stan LOW) - czuwanie aktywne.")
+                else:
+                    consecutive_low = 0
+                continue
+
+            now = time.time()
+            while active_samples and (now - active_samples[0] > MOTION_WINDOW_SEC):
+                active_samples.popleft()
+
+            if is_high:
+                consecutive_high += 1
+                # Dopiero po MIN_GLITCH_TICKS (0.5s) uznajemy sygnał za prawdziwą podczerwień, a nie szum kabla
+                if consecutive_high == MIN_GLITCH_TICKS:
+                    for i in range(MIN_GLITCH_TICKS):
+                        active_samples.append(now - (MIN_GLITCH_TICKS - 1 - i) * SAMPLE_TICK_SEC)
+                elif consecutive_high > MIN_GLITCH_TICKS:
+                    active_samples.append(now)
+            else:
+                consecutive_high = 0
+
+            active_sec = len(active_samples) * SAMPLE_TICK_SEC
+            current_hits = get_current_hits_locked(now)
+
+            if current_hits != last_logged_hits and current_hits > 0:
+                print(
+                    f"[DETEKTOR] Aktywność przy kasie: {active_sec:.2f}s / {REQUIRED_ACTIVE_SEC:.1f}s "
+                    f"(poziom {current_hits}/{MOTION_REQUIRED_HITS})"
+                )
+                last_logged_hits = current_hits
+            elif current_hits == 0:
+                last_logged_hits = 0
+
+            if active_sec >= REQUIRED_ACTIVE_SEC:
+                active_samples.clear()
+                consecutive_high = 0
+                last_logged_hits = 0
+                alert_type = "MOTION"
+                responder_name = ""
+                cooldown_active = True
+                print("[ALARM] Potwierdzono obecność klienta przy kasie! Wysyłam powiadomienia.")
+                send_push_to_all(
+                    "🚨 Klient czeka przy kasie!",
+                    "Wykryto obecność klienta przy pustej kasie. Kliknij, aby przyjąć.",
+                    "MOTION"
+                )
+                cooldown_timer = threading.Timer(COOLDOWN_SEC, reset_cooldown)
+                cooldown_timer.start()
 
 
 def firebase_relay_loop():
@@ -430,16 +510,21 @@ def firebase_relay_loop():
             continue
 
         try:
+            rem_ver, rem_log = refresh_github_info(force=False)
+            loc_ver = get_local_version()
             now = time.time()
+
             with state_lock:
-                active_hits = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
                 status_payload = {
                     "system_state": system_state,
                     "alert_type": alert_type,
                     "responder_name": responder_name,
-                    "motion_hits": len(active_hits),
+                    "motion_hits": get_current_hits_locked(now),
                     "motion_required": MOTION_REQUIRED_HITS,
-                    "version": get_local_version(),
+                    "version": loc_ver,
+                    "remote_version": rem_ver or loc_ver,
+                    "update_available": parse_version(rem_ver) > parse_version(loc_ver) if rem_ver else False,
+                    "changelog": rem_log or get_local_changelog(),
                     "subscribed_devices": len(load_subscriptions()),
                     "vapid_public_key": VAPID_PUBLIC_KEY,
                     "lte_enabled": True,
@@ -464,13 +549,16 @@ def firebase_relay_loop():
                     add_subscription_entry(cmd_data.get("subscription"))
                 elif action == "UNSUBSCRIBE":
                     remove_subscription_entry(cmd_data.get("endpoint"))
+                elif action == "UPDATE_CHECK":
+                    refresh_github_info(force=True)
+                elif action == "UPDATE_RUN":
+                    perform_self_update()
         except Exception as e:
             print(f"[FIREBASE RELAY WARN] {e}")
 
 
 switch.when_pressed = on_switch_on
 switch.when_released = on_switch_off
-# pir.when_motion = register_motion_hit
 help_button.when_pressed = trigger_help_request
 
 if switch.is_pressed:
@@ -519,12 +607,11 @@ def api_status():
     now = time.time()
     cfg = load_cloud_config()
     with state_lock:
-        active_hits = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
         return jsonify({
             "system_state": system_state,
             "alert_type": alert_type,
             "responder_name": responder_name,
-            "motion_hits": len(active_hits),
+            "motion_hits": get_current_hits_locked(now),
             "motion_required": MOTION_REQUIRED_HITS,
             "version": get_local_version(),
             "subscribed_devices": len(load_subscriptions()),
@@ -584,8 +671,7 @@ def api_clear():
 @app.route("/api/update-check", methods=["GET"])
 def api_update_check():
     local_ver = get_local_version()
-    remote_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
-    remote_changelog = fetch_github_text(GITHUB_RAW_CHANGELOG_URL)
+    remote_ver, remote_changelog = refresh_github_info(force=True)
 
     if not remote_ver:
         return jsonify({
@@ -610,27 +696,14 @@ def api_update_run():
         return jsonify({"ok": True}), 200
 
     try:
-        if os.path.exists(os.path.join(BASE_DIR, ".git")):
-            cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
-        else:
-            cmd = f"rm -rf {BASE_DIR} && git clone {GITHUB_REPO_URL} {BASE_DIR}"
-
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-        if res.returncode != 0:
-            return jsonify({"ok": False, "error": res.stderr}), 500
-
-        new_ver = get_local_version()
-
-        def _restart_service():
-            time.sleep(1.5)
-            subprocess.run(f"systemctl restart {SERVICE_NAME}", shell=True)
-
-        threading.Thread(target=_restart_service, daemon=True).start()
+        ok, info = perform_self_update()
+        if not ok:
+            return jsonify({"ok": False, "error": info}), 500
 
         return jsonify({
             "ok": True,
             "status": "restarting",
-            "new_version": new_ver,
+            "new_version": info,
             "changelog": get_local_changelog()
         })
     except Exception as e:
