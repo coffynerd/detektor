@@ -21,8 +21,8 @@ ARM_DELAY_SEC = 5           # Czas na odejście od kasy po włączeniu (5 sekund
 COOLDOWN_SEC = 60           # Przerwa między kolejnymi powiadomieniami z czujnika (60 sekund)
 ACK_PAUSE_SEC = 120         # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
 
-MOTION_WINDOW_SEC = 20.0      # Okno czasowe pamiętania próbek (20 sekund)
-MOTION_REQUIRED_HITS = 9      # Wymagana liczba potwierdzeń ruchu (3 razy)
+MOTION_WINDOW_SEC = 25.0      # Okno czasowe pamiętania próbek (20 sekund)
+MOTION_REQUIRED_HITS = 7      # Wymagana liczba potwierdzeń ruchu (3 razy)
 MOTION_SAMPLE_INTERVAL = 2.5  # Odstęp między kolejnymi sprawdzeniami (4.5 sekundy)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -82,7 +82,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.7"
+        return "1.0.8"
 
 
 def get_local_changelog():
