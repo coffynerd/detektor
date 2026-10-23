@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import re
 import sys
 import json
 import time
@@ -25,7 +24,7 @@ CLOUD_CONFIG_FILE = os.path.join(DATA_DIR, "cloud_config.json")
 SERVICE_NAME = "kasa-alarm.service"
 TUNNEL_SERVICE_NAME = "kasa-tunnel.service"
 
-FALLBACK_ADMIN_VERSION = "1.0.3"
+FALLBACK_ADMIN_VERSION = "1.0.4"
 # =============================================================
 
 
@@ -86,15 +85,26 @@ def get_local_admin_version():
     return FALLBACK_ADMIN_VERSION
 
 
+def get_lte_status_label():
+    try:
+        if os.path.exists(CLOUD_CONFIG_FILE):
+            with open(CLOUD_CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                if cfg.get("lte_enabled"):
+                    return "WŁĄCZONY"
+    except Exception:
+        pass
+    return "WYŁĄCZONY (Tylko Wi-Fi LAN)"
+
+
 def option_1_install():
     print("\n=== [1] INSTALACJA OPROGRAMOWANIA, VENV I USŁUGI SYSTEMD ===")
     run_cmd("apt-get update")
-    run_cmd("apt-get install -y git openssh-client python3-venv python3-pip python3-flask python3-gpiozero python3-requests python3-lgpio python3-cryptography network-manager")
+    run_cmd("apt-get install -y git python3-venv python3-pip python3-flask python3-gpiozero python3-requests python3-lgpio python3-cryptography network-manager")
 
     os.makedirs(DATA_DIR, exist_ok=True)
 
     if not os.path.exists(os.path.join(APP_DIR, ".git")):
-        print(f"Klonowanie repozytorium {GITHUB_REPO_URL} do {APP_DIR}...")
         shutil.rmtree(APP_DIR, ignore_errors=True)
         res = subprocess.run(f"git clone {GITHUB_REPO_URL} {APP_DIR}", shell=True)
         if res.returncode != 0:
@@ -105,10 +115,9 @@ def option_1_install():
     else:
         run_cmd(f"cd {APP_DIR} && git fetch --all && git reset --hard origin/main")
 
-    print("\nTworzenie środowiska wirtualnego venv (--system-site-packages)...")
     shutil.rmtree(VENV_DIR, ignore_errors=True)
     run_cmd(f"python3 -m venv --system-site-packages {VENV_DIR}")
-    run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid requests")
+    run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid")
 
     service_content = f"""[Unit]
 Description=System Czujnika Ruchu i Przycisku Pomocy przy Kasie (detektor)
@@ -147,22 +156,16 @@ def option_2_update_app():
     if not remote_ver:
         return
 
-    if parse_version(remote_ver) > parse_version(local_ver):
-        print(f"\n[!] Dostępna jest NOWA wersja programu czujnika ({remote_ver})!")
-        choice = input("Czy chcesz zaktualizować program główny teraz? (t/n): ").strip().lower()
-    else:
-        print("\n[i] Posiadasz aktualną wersję programu głównego.")
-        choice = input("Czy mimo to wymusić ponowne pobranie z GitHuba? (t/n): ").strip().lower()
-
+    choice = input("Czy chcesz pobrać najnowszą wersję i zrestartować czujnik? (t/n): ").strip().lower()
     if choice == "t":
         if os.path.exists(os.path.join(APP_DIR, ".git")):
             run_cmd(f"cd {APP_DIR} && git fetch --all && git reset --hard origin/main")
         else:
             run_cmd(f"rm -rf {APP_DIR} && git clone {GITHUB_REPO_URL} {APP_DIR}")
             run_cmd(f"python3 -m venv --system-site-packages {VENV_DIR}")
-            run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid requests")
+            run_cmd(f"{VENV_DIR}/bin/pip install pywebpush py-vapid")
         run_cmd(f"systemctl restart {SERVICE_NAME}")
-        print(f"\n[OK] Zaktualizowano program czujnika do wersji {get_local_app_version()} i zrestartowano usługę!")
+        print(f"\n[OK] Zaktualizowano program czujnika do wersji {get_local_app_version()}!")
 
 
 def option_3_update_admin():
@@ -176,17 +179,10 @@ def option_3_update_admin():
     if not remote_admin_ver:
         return
 
-    if parse_version(remote_admin_ver) > parse_version(local_admin_ver):
-        print(f"\n[!] Dostępna jest NOWA wersja Panelu Administratora ({remote_admin_ver})!")
-        choice = input("Czy pobrać i przeładować Panel Administratora teraz? (t/n): ").strip().lower()
-    else:
-        print("\n[i] Posiadasz aktualną wersję Panelu Administratora.")
-        choice = input("Czy mimo to wymusić pobranie nowej kopii admin.py z GitHuba? (t/n): ").strip().lower()
-
+    choice = input("Czy pobrać i przeładować Panel Administratora teraz? (t/n): ").strip().lower()
     if choice == "t":
         new_admin_code = fetch_github_text(GITHUB_ADMIN_SCRIPT_URL)
         if not new_admin_code:
-            print("[!] Nie udało się pobrać pliku admin.py z GitHuba.")
             return
 
         current_script_path = os.path.abspath(__file__)
@@ -203,7 +199,7 @@ def option_3_update_admin():
             with open(os.path.join(APP_DIR, "admin_version.txt"), "w", encoding="utf-8") as f:
                 f.write(remote_admin_ver + "\n")
 
-        print(f"\n[OK] Panel Administratora zaktualizowany do wersji {remote_admin_ver}! Przeładowuję skrypt...")
+        print(f"\n[OK] Panel Administratora zaktualizowany do wersji {remote_admin_ver}!")
         time.sleep(1)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -212,35 +208,26 @@ def option_4_wifi():
     print("\n=== [4] KONFIGURACJA SIECI WI-FI ===")
     ssid = input("Podaj nazwę sieci Wi-Fi (SSID): ").strip()
     password = input("Podaj hasło do Wi-Fi: ").strip()
-
     if not ssid:
-        print("[!] Anulowano - nazwa sieci nie może być pusta.")
         return
-
     run_cmd("raspi-config nonint do_wifi_country PL")
     res = subprocess.run(f'raspi-config nonint do_wifi_ssid_passphrase "{ssid}" "{password}"', shell=True)
-    if res.returncode == 0:
-        print(f"\n[OK] Zapisano sieć Wi-Fi '{ssid}'. Łączenie...")
-    else:
+    if res.returncode != 0:
         run_cmd(f'nmcli dev wifi connect "{ssid}" password "{password}"')
 
 
 def option_5_system_update():
     print("\n=== [5] AKTUALIZACJA SYSTEMU LINUX (APT) ===")
     run_cmd("apt-get update && apt-get upgrade -y && apt-get autoremove -y")
-    print("\n[OK] System operacyjny został zaktualizowany.")
 
 
 def option_6_reboot():
     print("\n=== [6] PONOWNE URUCHOMIENIE ===")
-    print("a) Szybki restart samego programu czujnika (trwa 2 sekundy)")
+    print("a) Szybki restart samego programu czujnika")
     print("b) Pełny restart całej malinki (sudo reboot)")
-    print("c) Anuluj")
-    sub = input("Wybierz (a/b/c): ").strip().lower()
-
+    sub = input("Wybierz (a/b): ").strip().lower()
     if sub == "a":
         run_cmd(f"systemctl restart {SERVICE_NAME}")
-        print("[OK] Usługa czujnika została zrestartowana.")
     elif sub == "b":
         run_cmd("reboot")
 
@@ -249,160 +236,59 @@ def option_7_show_vapid():
     print("\n=== [7] KLUCZ PUBLICZNY VAPID I STATYSTYKI TELEFONÓW ===")
     keys_path = os.path.join(DATA_DIR, "vapid_keys.json")
     subs_path = os.path.join(DATA_DIR, "push_subscriptions.json")
-
     if os.path.exists(keys_path):
         with open(keys_path, "r", encoding="utf-8") as f:
-            keys = json.load(f)
-        print(f"Application Server Key (Public Key):\n\n{keys.get('publicKey')}\n")
-    else:
-        print("[!] Klucze VAPID nie zostały jeszcze wygenerowane.")
-
+            print(f"Public Key:\n{json.load(f).get('publicKey')}\n")
     if os.path.exists(subs_path):
         with open(subs_path, "r", encoding="utf-8") as f:
-            subs = json.load(f)
-        print(f"Zarejestrowane telefony pracowników: {len(subs)}")
-    else:
-        print("Zarejestrowane telefony pracowników: 0")
+            print(f"Zarejestrowane telefony: {len(json.load(f))}")
 
 
 def option_8_diagnostics():
     print("\n=== [8] DIAGNOSTYKA SERWERA I LOGI BŁĘDÓW ===")
+    print(f"Tryb LTE / Chmura: {get_lte_status_label()}")
     run_cmd("hostname -I")
-    if os.path.exists(PUBLIC_URL_FILE):
-        with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
-            pub = f.read().strip()
-        if pub:
-            print(f"Aktywny adres publiczny HTTPS (Tunel): {pub}")
     run_cmd("curl -i http://localhost:5000/api/status")
     print("\n--- Ostatnie 15 linii logów usługi kasa-alarm.service ---")
     run_cmd(f"journalctl -u {SERVICE_NAME} -n 15 --no-pager")
 
 
-def option_9_tunnel():
-    print("\n=== [9] DARMOWY TUNEL HTTPS (DOSTĘP SPOZA WI-FI / NA LTE) ===")
-    print("Tunel wystawia malinkę pod bezpiecznym adresem https://... bez publicznego IP.")
-    print("a) Włącz / Zrestartuj darmowy tunel HTTPS (localhost.run przez SSH - bez konta)")
-    print("b) Pokaż aktualny adres publiczny HTTPS tunelu")
-    print("c) Wyłącz tunel HTTPS")
+def option_9_lte_toggle():
+    print("\n=== [9] TRYB LTE / DOSTĘP SPOZA WI-FI (WŁĄCZ / WYŁĄCZ) ===")
+    print(f"Aktualny status: {get_lte_status_label()}")
+    print("a) WYŁĄCZ całkowicie sieć LTE / Tunel / Firebase (Czysty, niezawodny tryb lokalny Wi-Fi)")
+    print("b) WŁĄCZ tryb LTE przez Firebase Relay")
     print("0) Powrót")
-    sub = input("Wybierz (a/b/c/0): ").strip().lower()
+    sub = input("Wybierz (a/b/0): ").strip().lower()
 
+    os.makedirs(DATA_DIR, exist_ok=True)
     if sub == "a":
-        os.makedirs(DATA_DIR, exist_ok=True)
-        ssh_key_path = "/root/.ssh/id_ed25519"
-        if not os.path.exists(ssh_key_path):
-            os.makedirs("/root/.ssh", exist_ok=True)
-            run_cmd(f'ssh-keygen -t ed25519 -f {ssh_key_path} -N "" -q')
-
-        tunnel_runner = os.path.join(DATA_DIR, "run_tunnel.py")
-        runner_code = f'''#!/usr/bin/env python3
-import re
-import time
-import subprocess
-
-PUBLIC_URL_FILE = "{PUBLIC_URL_FILE}"
-
-while True:
-    proc = subprocess.Popen(
-        [
-            "ssh", "-o", "StrictHostKeyChecking=no",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ExitOnForwardFailure=yes",
-            "-R", "80:localhost:5000", "nokey@localhost.run"
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-        match = re.search(r"(https://[a-zA-Z0-9.-]+\\.lhr\\.life)", line)
-        if match:
-            url = match.group(1)
-            with open(PUBLIC_URL_FILE, "w", encoding="utf-8") as f:
-                f.write(url)
-    proc.wait()
-    time.sleep(5)
-'''
-        with open(tunnel_runner, "w", encoding="utf-8") as f:
-            f.write(runner_code)
-        os.chmod(tunnel_runner, 0o755)
-
-        tunnel_service = f"""[Unit]
-Description=Publiczny Tunel HTTPS dla Czujnika Kasy (localhost.run)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/python3 -u {tunnel_runner}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"""
-        with open(f"/etc/systemd/system/{TUNNEL_SERVICE_NAME}", "w", encoding="utf-8") as f:
-            f.write(tunnel_service)
-
-        run_cmd("systemctl daemon-reload")
-        run_cmd(f"systemctl enable {TUNNEL_SERVICE_NAME}")
-        run_cmd(f"systemctl restart {TUNNEL_SERVICE_NAME}")
-        print("\nCzekam 5 sekund na wygenerowanie adresu HTTPS...")
-        time.sleep(5)
-        if os.path.exists(PUBLIC_URL_FILE):
-            with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
-                print(f"\n[OK] Twój publiczny adres HTTPS:\n>>> {f.read().strip()} <<<\n")
-        else:
-            print("[i] Tunel startuje w tle. Wybierz za chwilę opcję 9 -> b, aby odczytać adres.")
-
-    elif sub == "b":
-        if os.path.exists(PUBLIC_URL_FILE):
-            with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
-                print(f"\nAktualny adres publiczny HTTPS:\n>>> {f.read().strip()} <<<\n")
-        else:
-            print("\n[!] Brak zapisanego adresu. Uruchom najpierw opcję 9 -> a.")
-
-    elif sub == "c":
-        run_cmd(f"systemctl stop {TUNNEL_SERVICE_NAME}")
-        run_cmd(f"systemctl disable {TUNNEL_SERVICE_NAME}")
+        run_cmd(f"systemctl stop {TUNNEL_SERVICE_NAME} 2>/dev/null")
+        run_cmd(f"systemctl disable {TUNNEL_SERVICE_NAME} 2>/dev/null")
         if os.path.exists(PUBLIC_URL_FILE):
             os.remove(PUBLIC_URL_FILE)
-        print("[OK] Tunel HTTPS został wyłączony.")
+        with open(CLOUD_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"lte_enabled": False, "firebase_db_url": ""}, f, indent=2)
+        run_cmd(f"systemctl restart {SERVICE_NAME}")
+        print("\n[OK] Sieć LTE i tunele zostały CAŁKOWICIE WYŁĄCZONE. System działa wyłącznie lokalnie!")
 
-
-def option_10_firebase_relay():
-    print("\n=== [10] KONFIGURACJA FIREBASE RELAY (SERWER POŚREDNICZĄCY) ===")
-    print("Jeśli podasz URL swojej bazy Firebase Realtime Database (np. https://twoj-projekt.firebaseio.com),")
-    print("malinka będzie co 2s synchronizować stan z chmurą bez potrzeby używania tuneli i przekierowania portów.")
-    current_url = ""
-    if os.path.exists(CLOUD_CONFIG_FILE):
-        try:
-            with open(CLOUD_CONFIG_FILE, "r", encoding="utf-8") as f:
-                current_url = json.load(f).get("firebase_db_url", "")
-        except Exception:
-            pass
-    print(f"Aktualny adres Firebase DB: {current_url or 'Brak (wyłączone)'}")
-    new_url = input("Podaj nowy URL bazy Firebase (lub wciśnij Enter, aby wyłączyć): ").strip()
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CLOUD_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump({"firebase_db_url": new_url}, f, indent=2)
-    run_cmd(f"systemctl restart {SERVICE_NAME}")
-    print("[OK] Zapisano konfigurację Firebase Relay i zrestartowano usługę.")
+    elif sub == "b":
+        db_url = input("Podaj URL bazy Firebase Realtime DB (https://...): ").strip()
+        with open(CLOUD_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"lte_enabled": bool(db_url), "firebase_db_url": db_url}, f, indent=2)
+        run_cmd(f"systemctl restart {SERVICE_NAME}")
+        print("\n[OK] Zapisano ustawienia trybu LTE.")
 
 
 def main():
     if os.geteuid() != 0:
-        print("[!] Uruchom ten skrypt z uprawnieniami administratora:")
-        print("    sudo python3 admin.py")
+        print("Uruchom jako root: sudo python3 admin.py")
         sys.exit(1)
 
     while True:
-        print("\n" + "=" * 68)
-        print(f" PANEL ADMINISTRATORA v{get_local_admin_version()} | Program czujnika: v{get_local_app_version()}")
-        print("=" * 68)
+        print("\n" + "=" * 70)
+        print(f" PANEL ADMINA v{get_local_admin_version()} | Czujnik: v{get_local_app_version()} | LTE: {get_lte_status_label()}")
+        print("=" * 70)
         print("1. Zainstaluj oprogramowanie i Web Push (pierwszy start / po awarii)")
         print("2. Zaktualizuj program czujnika z GitHuba (sprawdź version.txt)")
         print("3. Zaktualizuj ten Panel Administratora (sprawdź admin_version.txt)")
@@ -411,12 +297,11 @@ def main():
         print("6. Uruchom ponownie czujnik / malinkę (reboot)")
         print("7. Pokaż klucz VAPID i liczbę zapisanych telefonów")
         print("8. Diagnostyka serwera i podgląd logów błędów")
-        print("9. Darmowy Tunel HTTPS (dostęp spoza Wi-Fi / na LTE)")
-        print("10. Konfiguracja Firebase Relay (chmurowy serwer pośredniczący)")
+        print("9. Włącz / Wyłącz obsługę sieci LTE (powrót do czystego Wi-Fi LAN)")
         print("0. Wyjdź")
-        print("-" * 68)
+        print("-" * 70)
 
-        choice = input("Wybierz opcję [0-10]: ").strip()
+        choice = input("Wybierz opcję [0-9]: ").strip()
         if choice == "1":
             option_1_install()
         elif choice == "2":
@@ -434,14 +319,9 @@ def main():
         elif choice == "8":
             option_8_diagnostics()
         elif choice == "9":
-            option_9_tunnel()
-        elif choice == "10":
-            option_10_firebase_relay()
+            option_9_lte_toggle()
         elif choice == "0":
-            print("Do zobaczenia!")
             break
-        else:
-            print("[!] Nieprawidłowy wybór.")
 
 
 if __name__ == "__main__":
