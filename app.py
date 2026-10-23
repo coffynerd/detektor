@@ -17,13 +17,15 @@ PIR_PIN = 17        # Pin fizyczny 11 - Czujnik ruchu DFRobot SEN0171
 SWITCH_PIN = 27     # Pin fizyczny 13 - Przełącznik ON/OFF (bistabilny)
 HELP_BTN_PIN = 22   # Pin fizyczny 15 - Rezerwacja pod fizyczny przycisk "Wezwij pomoc"
 
-ARM_DELAY_SEC = 5           # Czas na odejście od kasy po włączeniu (5 sekund)
-COOLDOWN_SEC = 60           # Przerwa między kolejnymi powiadomieniami z czujnika (60 sekund)
-ACK_PAUSE_SEC = 120         # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
+# ================= PARAMETRY CZUJNIKA (ODPORNE NA PRZECIĄGI I ZAKŁÓCENIA) =================
+ARM_DELAY_SEC = 10            # 10 sekund na odejście i uspokojenie zasilania po przełączeniu
+COOLDOWN_SEC = 60             # Przerwa między kolejnymi alarmami (60s)
+ACK_PAUSE_SEC = 120           # Wyciszenie po kliknięciu "Idę do kasy" (120s)
 
-MOTION_WINDOW_SEC = 25.0      # Okno czasowe pamiętania próbek (20 sekund)
-MOTION_REQUIRED_HITS = 6      # Wymagana liczba potwierdzeń ruchu (3 razy)
-MOTION_SAMPLE_INTERVAL = 3  # Odstęp między kolejnymi sprawdzeniami (4.5 sekundy)
+MOTION_WINDOW_SEC = 25.0      # Okno czasowe pamiętania próbek (25 sekund)
+MOTION_REQUIRED_HITS = 3      # Wymagane 3 niezależne potwierdzenia
+MOTION_SAMPLE_INTERVAL = 4.5  # MUSI wynosić min. 4.5s (więcej niż 3s podtrzymania czujnika!)
+MIN_SUSTAIN_SEC = 0.8         # Sygnał musi trwać ciągle min. 0.8s (odrzuca zakłócenia z metalowej kasy)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = os.path.join(BASE_DIR, "version.txt")
@@ -82,7 +84,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.9"
+        return "1.0.10"
 
 
 def get_local_changelog():
@@ -283,22 +285,26 @@ def cancel_timers():
 
 
 def finish_arming():
-    global system_state, motion_timestamps
+    global system_state, motion_timestamps, last_sample_time
     with state_lock:
         if system_state == "ARMING":
             motion_timestamps.clear()
+            # Blokujemy próbkowanie na 3s po uzbrojeniu, jeśli czujnik jeszcze widzi odchodzącego kasjera
+            last_sample_time = time.time()
             system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (v1.0.6).")
+            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu.")
 
 
-def reset_cooldown():
-    global cooldown_active, alert_type, responder_name, motion_timestamps
+def finish_arming():
+    global system_state, motion_timestamps, last_sample_time
     with state_lock:
-        cooldown_active = False
-        motion_timestamps.clear()
-        if alert_type == "MOTION":
-            alert_type = "NONE"
-            responder_name = ""
+        if system_state == "ARMING":
+            motion_timestamps.clear()
+            # Ustawiamy last_sample_time na "teraz", dzięki czemu przez pierwsze 4.5s
+            # po uzbrojeniu zignorujemy ewentualny impuls startowy czujnika
+            last_sample_time = time.time()
+            system_state = "ARMED"
+            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu.")
 
 
 def on_switch_on():
@@ -338,14 +344,14 @@ def register_motion_hit():
         motion_timestamps.append(now)
 
         hits = len(motion_timestamps)
-        print(f"[DETEKTOR] Wykryto ruch przy kasie ({hits}/{MOTION_REQUIRED_HITS})")
+        print(f"[DETEKTOR] Potwierdzony sygnał przy kasie ({hits}/{MOTION_REQUIRED_HITS})")
 
         if hits >= MOTION_REQUIRED_HITS:
             motion_timestamps.clear()
             alert_type = "MOTION"
             responder_name = ""
             cooldown_active = True
-            print("[ALARM] Potwierdzono obecność klienta przy kasie (3/3)! Wysyłam powiadomienia.")
+            print("[ALARM] Potwierdzono obecność klienta przy kasie! Wysyłam powiadomienia.")
             send_push_to_all(
                 "🚨 Klient czeka przy kasie!",
                 "Wykryto stałą obecność przy pustej kasie. Kliknij, aby przyjąć.",
@@ -353,7 +359,6 @@ def register_motion_hit():
             )
             cooldown_timer = threading.Timer(COOLDOWN_SEC, reset_cooldown)
             cooldown_timer.start()
-
 
 def trigger_help_request():
     global alert_type, responder_name
@@ -396,10 +401,22 @@ def handle_clear_action():
 
 
 def motion_monitor_loop():
+    """
+    Sprawdza nie tylko sam impuls, ale wymaga, aby stan wysoki utrzymał się
+    nieprzerwanie przez MIN_SUSTAIN_SEC (0.8s), co eliminuje zakłócenia z metalowej kasy.
+    """
     while True:
-        time.sleep(0.5)
+        time.sleep(0.2)
         if system_state == "ARMED" and not cooldown_active and pir.motion_detected:
-            register_motion_hit()
+            # Sprawdzamy, czy sygnał utrzymuje się nieprzerwanie przez 0.8 sekundy
+            sustained = True
+            for _ in range(4):
+                time.sleep(MIN_SUSTAIN_SEC / 4.0)
+                if not pir.motion_detected or system_state != "ARMED":
+                    sustained = False
+                    break
+            if sustained:
+                register_motion_hit()
 
 
 def firebase_relay_loop():
@@ -453,7 +470,7 @@ def firebase_relay_loop():
 
 switch.when_pressed = on_switch_on
 switch.when_released = on_switch_off
-pir.when_motion = register_motion_hit
+# pir.when_motion = register_motion_hit
 help_button.when_pressed = trigger_help_request
 
 if switch.is_pressed:
