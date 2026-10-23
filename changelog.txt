@@ -1,5 +1,4 @@
-Wersja 1.0.4:
-- Dodano endpoint POST /api/unsubscribe (natychmiastowa aktualizacja licznika zapisanych telefonów po wyłączeniu powiadomień)
-- Dodano obsługę połączeń spoza sieci Wi-Fi (automatyczny tunel HTTPS oraz synchronizacja Firebase Relay)
-- Rozbudowano nagłówki CORS o obsługę tuneli publicznych (LTE/5G)
-- Dodano zwracanie aktywnego adresu publicznego (public_url) bezpośrednio w /api/status
+Wersja 1.0.5:
+- Dodano pełną obsługę subskrypcji Web Push (VAPID, SUBSCRIBE, UNSUBSCRIBE) przez pośrednika Firebase Relay
+- Dodano zdalne sprawdzanie i instalowanie aktualizacji z GitHuba przez pośrednika Firebase (UPDATE_CHECK, UPDATE_RUN)
+- Zabezpieczono pętlę Firebase Relay przed zawieszaniem połączenia przy chwilowych spadkach Wi-Fi
