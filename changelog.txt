@@ -1,4 +1,4 @@
-Wersja 1.0.6:
-- Dodano twardy wyłącznik sieci LTE / Chmury (domyślnie WYŁĄCZONY - 100% stabilny tryb lokalny LAN jak w v1.0.3)
-- Usunięto zewnętrzne zależności HTTP na rzecz wbudowanego urllib
-- Dodano endpoint /api/lte-mode do włączania/wyłączania trybu LTE z poziomu panelu WWW
+Wersja 1.0.11:
+- Nowy algorytm detekcji obecności (Sliding Presence Window 0.25s) - niezawodnie wykrywa klientów stojących nieruchomo przy kasie
+- Filtr antyszumowy odrzucający pojedyncze zakłócenia z kabla zasilającego RPi0 (<0.5s)
+- Wymuszenie stanu niskiego (LOW) czujnika przed uzbrojeniem (brak samoczynnych alarmów po starcie)
