@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 import os
-import re
 import time
 import json
 import base64
 import threading
 import subprocess
 import urllib.request
-import requests
 from flask import Flask, jsonify, request
 from gpiozero import MotionSensor, Button
 from pywebpush import webpush, WebPushException
@@ -23,7 +21,6 @@ ARM_DELAY_SEC = 5           # Czas na odejście od kasy po włączeniu (5 sekund
 COOLDOWN_SEC = 60           # Przerwa między kolejnymi powiadomieniami z czujnika (60 sekund)
 ACK_PAUSE_SEC = 120         # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
 
-# Filtr fałszywych alarmów (dostosowany do wolnego przejścia 5-6s + ~2.5s podtrzymania PIR):
 MOTION_WINDOW_SEC = 20.0      # Okno czasowe pamiętania próbek (20 sekund)
 MOTION_REQUIRED_HITS = 3      # Wymagana liczba potwierdzeń ruchu (3 razy)
 MOTION_SAMPLE_INTERVAL = 4.5  # Odstęp między kolejnymi sprawdzeniami (4.5 sekundy)
@@ -36,8 +33,8 @@ GITHUB_REPO_URL = "https://github.com/coffynerd/detektor.git"
 GITHUB_RAW_VERSION_URL = "https://raw.githubusercontent.com/coffynerd/detektor/main/version.txt"
 GITHUB_RAW_CHANGELOG_URL = "https://raw.githubusercontent.com/coffynerd/detektor/main/changelog.txt"
 SERVICE_NAME = "kasa-alarm.service"
+TUNNEL_SERVICE_NAME = "kasa-tunnel.service"
 
-# Stały katalog danych (nie kasuje się podczas aktualizacji z GitHuba)
 DATA_DIR = "/var/lib/kasa-alarm"
 SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "push_subscriptions.json")
 VAPID_KEYS_FILE = os.path.join(DATA_DIR, "vapid_keys.json")
@@ -60,11 +57,6 @@ last_sample_time = 0.0
 
 arm_timer = None
 cooldown_timer = None
-
-# Cache danych o aktualizacji z GitHuba dla pośrednika Firebase
-cached_remote_version = ""
-cached_remote_changelog = ""
-last_github_check_ts = 0.0
 
 
 @app.after_request
@@ -90,7 +82,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.5"
+        return "1.0.6"
 
 
 def get_local_changelog():
@@ -101,7 +93,32 @@ def get_local_changelog():
         return "Brak opisu zmian."
 
 
+def load_cloud_config():
+    """Domyślnie tryb LTE jest WYŁĄCZONY (lte_enabled: False)."""
+    default_cfg = {"lte_enabled": False, "firebase_db_url": ""}
+    try:
+        if os.path.exists(CLOUD_CONFIG_FILE):
+            with open(CLOUD_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {
+                    "lte_enabled": bool(data.get("lte_enabled", False)),
+                    "firebase_db_url": str(data.get("firebase_db_url", "")).strip()
+                }
+    except Exception:
+        pass
+    return default_cfg
+
+
+def save_cloud_config(cfg):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CLOUD_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
 def get_public_tunnel_url():
+    cfg = load_cloud_config()
+    if not cfg.get("lte_enabled"):
+        return ""
     try:
         if os.path.exists(PUBLIC_URL_FILE):
             with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
@@ -109,16 +126,6 @@ def get_public_tunnel_url():
     except Exception:
         pass
     return ""
-
-
-def load_cloud_config():
-    try:
-        if os.path.exists(CLOUD_CONFIG_FILE):
-            with open(CLOUD_CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {"firebase_db_url": ""}
 
 
 def fetch_github_text(raw_url):
@@ -139,38 +146,15 @@ def fetch_github_text(raw_url):
         return None
 
 
-def refresh_github_info(force=False):
-    global cached_remote_version, cached_remote_changelog, last_github_check_ts
-    now = time.time()
-    if not force and cached_remote_version and (now - last_github_check_ts < 300):
-        return cached_remote_version, cached_remote_changelog
-
-    rem_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
-    rem_log = fetch_github_text(GITHUB_RAW_CHANGELOG_URL)
-    if rem_ver:
-        cached_remote_version = rem_ver
-    if rem_log:
-        cached_remote_changelog = rem_log
-    last_github_check_ts = now
-    return cached_remote_version, cached_remote_changelog
-
-
-def perform_self_update():
-    if os.path.exists(os.path.join(BASE_DIR, ".git")):
-        cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
-    else:
-        cmd = f"rm -rf {BASE_DIR} && git clone {GITHUB_REPO_URL} {BASE_DIR}"
-
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-    if res.returncode != 0:
-        return False, res.stderr
-
-    def _restart_service():
-        time.sleep(1.5)
-        subprocess.run(f"systemctl restart {SERVICE_NAME}", shell=True)
-
-    threading.Thread(target=_restart_service, daemon=True).start()
-    return True, get_local_version()
+def http_json_request(method, url, payload=None, timeout=3.0):
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8").strip()
+        return resp.status, (json.loads(raw) if raw else None)
 
 
 def init_vapid_keys():
@@ -305,7 +289,7 @@ def finish_arming():
         if system_state == "ARMING":
             motion_timestamps.clear()
             system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (v1.0.5).")
+            print("[SYSTEM] Uzbrojono - aktywne monitorowanie ruchu (v1.0.6).")
 
 
 def reset_cooldown():
@@ -412,23 +396,18 @@ def motion_monitor_loop():
 
 
 def firebase_relay_loop():
-    """
-    Niezawodny wątek pośredniczący (Firebase Realtime Database Relay).
-    Synchronizuje stan, klucz VAPID, subskrypcje oraz aktualizacje przez chmurę.
-    """
-    session = requests.Session()
+    """Wątek LTE / Firebase działa TYLKO wtedy, gdy lte_enabled == True."""
     while True:
-        time.sleep(2.0)
+        time.sleep(2.5)
         cfg = load_cloud_config()
-        db_url = cfg.get("firebase_db_url", "").strip().rstrip("/")
+        if not cfg.get("lte_enabled"):
+            continue
+        db_url = cfg.get("firebase_db_url", "").rstrip("/")
         if not db_url:
             continue
 
         try:
-            rem_ver, rem_log = refresh_github_info(force=False)
-            loc_ver = get_local_version()
             now = time.time()
-
             with state_lock:
                 active_hits = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
                 status_payload = {
@@ -437,52 +416,37 @@ def firebase_relay_loop():
                     "responder_name": responder_name,
                     "motion_hits": len(active_hits),
                     "motion_required": MOTION_REQUIRED_HITS,
-                    "version": loc_ver,
-                    "remote_version": rem_ver or loc_ver,
-                    "update_available": parse_version(rem_ver) > parse_version(loc_ver) if rem_ver else False,
-                    "changelog": rem_log or get_local_changelog(),
+                    "version": get_local_version(),
                     "subscribed_devices": len(load_subscriptions()),
                     "vapid_public_key": VAPID_PUBLIC_KEY,
+                    "lte_enabled": True,
                     "public_url": get_public_tunnel_url(),
                     "last_updated": int(now * 1000)
                 }
 
-            session.put(f"{db_url}/kasa_relay/status.json", json=status_payload, timeout=(2.5, 4.0))
+            http_json_request("PUT", f"{db_url}/kasa_relay/status.json", status_payload, timeout=3.0)
 
-            cmd_res = session.get(f"{db_url}/kasa_relay/command.json", timeout=(2.5, 4.0))
-            if cmd_res.status_code == 200:
-                cmd_data = cmd_res.json()
-                if isinstance(cmd_data, dict) and cmd_data.get("action"):
-                    action = cmd_data.get("action")
-                    # Najpierw usuwamy komendę z kolejki, aby nie wykonała się podwójnie
-                    session.delete(f"{db_url}/kasa_relay/command.json", timeout=(2.5, 4.0))
+            code, cmd_data = http_json_request("GET", f"{db_url}/kasa_relay/command.json", timeout=3.0)
+            if code == 200 and isinstance(cmd_data, dict) and cmd_data.get("action"):
+                action = cmd_data.get("action")
+                http_json_request("DELETE", f"{db_url}/kasa_relay/command.json", timeout=3.0)
 
-                    if action == "ACK":
-                        handle_ack_action(cmd_data.get("name", "Pracownik"))
-                    elif action == "HELP":
-                        trigger_help_request()
-                    elif action == "CLEAR":
-                        with state_lock:
-                            global alert_type, responder_name
-                            alert_type = "NONE"
-                            responder_name = ""
-                            motion_timestamps.clear()
-                    elif action == "SUBSCRIBE":
-                        add_subscription_entry(cmd_data.get("subscription"))
-                    elif action == "UNSUBSCRIBE":
-                        remove_subscription_entry(cmd_data.get("endpoint"))
-                    elif action == "UPDATE_CHECK":
-                        refresh_github_info(force=True)
-                    elif action == "UPDATE_RUN":
-                        perform_self_update()
-
+                if action == "ACK":
+                    handle_ack_action(cmd_data.get("name", "Pracownik"))
+                elif action == "HELP":
+                    trigger_help_request()
+                elif action == "CLEAR":
+                    with state_lock:
+                        global alert_type, responder_name
+                        alert_type = "NONE"
+                        responder_name = ""
+                        motion_timestamps.clear()
+                elif action == "SUBSCRIBE":
+                    add_subscription_entry(cmd_data.get("subscription"))
+                elif action == "UNSUBSCRIBE":
+                    remove_subscription_entry(cmd_data.get("endpoint"))
         except Exception as e:
             print(f"[FIREBASE RELAY WARN] {e}")
-            try:
-                session.close()
-            except Exception:
-                pass
-            session = requests.Session()
 
 
 switch.when_pressed = on_switch_on
@@ -534,6 +498,7 @@ def unsubscribe_push():
 @app.route("/api/status", methods=["GET"])
 def api_status():
     now = time.time()
+    cfg = load_cloud_config()
     with state_lock:
         active_hits = [t for t in motion_timestamps if now - t <= MOTION_WINDOW_SEC]
         return jsonify({
@@ -545,8 +510,31 @@ def api_status():
             "version": get_local_version(),
             "subscribed_devices": len(load_subscriptions()),
             "vapid_public_key": VAPID_PUBLIC_KEY,
+            "lte_enabled": cfg.get("lte_enabled", False),
             "public_url": get_public_tunnel_url()
         })
+
+
+@app.route("/api/lte-mode", methods=["GET", "POST", "OPTIONS"])
+def api_lte_mode():
+    """Pozwala włączyć lub całkowicie wyłączyć tryb LTE z poziomu Panelu Admina."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    cfg = load_cloud_config()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        enabled = bool(data.get("lte_enabled", False))
+        cfg["lte_enabled"] = enabled
+        if "firebase_db_url" in data:
+            cfg["firebase_db_url"] = str(data["firebase_db_url"]).strip()
+        save_cloud_config(cfg)
+
+        if not enabled:
+            subprocess.run(f"systemctl stop {TUNNEL_SERVICE_NAME} 2>/dev/null", shell=True)
+            subprocess.run(f"systemctl disable {TUNNEL_SERVICE_NAME} 2>/dev/null", shell=True)
+
+    return jsonify({"ok": True, "lte_enabled": cfg.get("lte_enabled", False)})
 
 
 @app.route("/api/ack", methods=["POST", "OPTIONS"])
@@ -583,7 +571,8 @@ def api_clear():
 @app.route("/api/update-check", methods=["GET"])
 def api_update_check():
     local_ver = get_local_version()
-    remote_ver, remote_changelog = refresh_github_info(force=True)
+    remote_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
+    remote_changelog = fetch_github_text(GITHUB_RAW_CHANGELOG_URL)
 
     if not remote_ver:
         return jsonify({
@@ -608,14 +597,27 @@ def api_update_run():
         return jsonify({"ok": True}), 200
 
     try:
-        ok, info = perform_self_update()
-        if not ok:
-            return jsonify({"ok": False, "error": info}), 500
+        if os.path.exists(os.path.join(BASE_DIR, ".git")):
+            cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
+        else:
+            cmd = f"rm -rf {BASE_DIR} && git clone {GITHUB_REPO_URL} {BASE_DIR}"
+
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            return jsonify({"ok": False, "error": res.stderr}), 500
+
+        new_ver = get_local_version()
+
+        def _restart_service():
+            time.sleep(1.5)
+            subprocess.run(f"systemctl restart {SERVICE_NAME}", shell=True)
+
+        threading.Thread(target=_restart_service, daemon=True).start()
 
         return jsonify({
             "ok": True,
             "status": "restarting",
-            "new_version": info,
+            "new_version": new_ver,
             "changelog": get_local_changelog()
         })
     except Exception as e:
@@ -624,11 +626,12 @@ def api_update_run():
 
 @app.route("/")
 def index():
+    cfg = load_cloud_config()
     return jsonify({
         "service": "Detektor Kasa API (coffynerd/detektor)",
         "version": get_local_version(),
         "status": "online",
-        "public_url": get_public_tunnel_url()
+        "lte_enabled": cfg.get("lte_enabled", False)
     })
 
 
