@@ -22,7 +22,7 @@ COOLDOWN_SEC = 60           # Przerwa między kolejnymi powiadomieniami z czujni
 ACK_PAUSE_SEC = 120         # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
 
 MOTION_WINDOW_SEC = 20.0      # Okno czasowe pamiętania próbek (20 sekund)
-MOTION_REQUIRED_HITS = 3      # Wymagana liczba potwierdzeń ruchu (3 razy)
+MOTION_REQUIRED_HITS = 5      # Wymagana liczba potwierdzeń ruchu (3 razy)
 MOTION_SAMPLE_INTERVAL = 4.5  # Odstęp między kolejnymi sprawdzeniami (4.5 sekundy)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
