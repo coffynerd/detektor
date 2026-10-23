@@ -94,7 +94,6 @@ def get_local_changelog():
 
 
 def load_cloud_config():
-    """Domyślnie tryb LTE jest WYŁĄCZONY (lte_enabled: False)."""
     default_cfg = {"lte_enabled": False, "firebase_db_url": ""}
     try:
         if os.path.exists(CLOUD_CONFIG_FILE):
@@ -388,6 +387,14 @@ def handle_ack_action(worker_name):
             )
 
 
+def handle_clear_action():
+    global alert_type, responder_name, motion_timestamps
+    with state_lock:
+        alert_type = "NONE"
+        responder_name = ""
+        motion_timestamps.clear()
+
+
 def motion_monitor_loop():
     while True:
         time.sleep(0.5)
@@ -396,7 +403,6 @@ def motion_monitor_loop():
 
 
 def firebase_relay_loop():
-    """Wątek LTE / Firebase działa TYLKO wtedy, gdy lte_enabled == True."""
     while True:
         time.sleep(2.5)
         cfg = load_cloud_config()
@@ -436,11 +442,7 @@ def firebase_relay_loop():
                 elif action == "HELP":
                     trigger_help_request()
                 elif action == "CLEAR":
-                    with state_lock:
-                        global alert_type, responder_name
-                        alert_type = "NONE"
-                        responder_name = ""
-                        motion_timestamps.clear()
+                    handle_clear_action()
                 elif action == "SUBSCRIBE":
                     add_subscription_entry(cmd_data.get("subscription"))
                 elif action == "UNSUBSCRIBE":
@@ -517,7 +519,6 @@ def api_status():
 
 @app.route("/api/lte-mode", methods=["GET", "POST", "OPTIONS"])
 def api_lte_mode():
-    """Pozwala włączyć lub całkowicie wyłączyć tryb LTE z poziomu Panelu Admina."""
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
 
@@ -559,12 +560,7 @@ def api_help():
 def api_clear():
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
-
-    global alert_type, responder_name, motion_timestamps
-    with state_lock:
-        alert_type = "NONE"
-        responder_name = ""
-        motion_timestamps.clear()
+    handle_clear_action()
     return jsonify({"ok": True})
 
 
