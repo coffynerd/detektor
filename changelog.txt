@@ -1,4 +1,4 @@
-Wersja 1.0.5:
-- Dodano pełną obsługę subskrypcji Web Push (VAPID, SUBSCRIBE, UNSUBSCRIBE) przez pośrednika Firebase Relay
-- Dodano zdalne sprawdzanie i instalowanie aktualizacji z GitHuba przez pośrednika Firebase (UPDATE_CHECK, UPDATE_RUN)
-- Zabezpieczono pętlę Firebase Relay przed zawieszaniem połączenia przy chwilowych spadkach Wi-Fi
+Wersja 1.0.6:
+- Dodano twardy wyłącznik sieci LTE / Chmury (domyślnie WYŁĄCZONY - 100% stabilny tryb lokalny LAN jak w v1.0.3)
+- Usunięto zewnętrzne zależności HTTP na rzecz wbudowanego urllib
+- Dodano endpoint /api/lte-mode do włączania/wyłączania trybu LTE z poziomu panelu WWW
