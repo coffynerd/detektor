@@ -6,14 +6,13 @@ import base64
 import threading
 import subprocess
 import urllib.request
-from collections import deque
 from flask import Flask, jsonify, request
 from gpiozero import MotionSensor, Button
 from pywebpush import webpush, WebPushException
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 
-# ================= KONFIGURACJA SPRZĘTOWA I DETEKCJI (v1.0.11) =================
+# ================= KONFIGURACJA SPRZĘTOWA I DETEKCJI (v1.0.12) =================
 PIR_PIN = 17        # Pin fizyczny 11 - Czujnik ruchu DFRobot SEN0171
 SWITCH_PIN = 27     # Pin fizyczny 13 - Przełącznik ON/OFF (bistabilny)
 HELP_BTN_PIN = 22   # Pin fizyczny 15 - Rezerwacja pod fizyczny przycisk "Wezwij pomoc"
@@ -22,12 +21,12 @@ ARM_DELAY_SEC = 8           # Czas na odejście od kasy po włączeniu przełąc
 COOLDOWN_SEC = 60           # Przerwa między kolejnymi powiadomieniami z czujnika (60 sekund)
 ACK_PAUSE_SEC = 120         # Czas wyciszenia czujnika po kliknięciu "Idę do kasy" (2 minuty)
 
-# Nowy algorytm Sliding Presence (rozwiązuje problem nieruchomych klientów i szumu z kabla):
-SAMPLE_TICK_SEC = 0.25          # Częstotliwość próbkowania czujnika (co 0.25 sekundy)
-MIN_GLITCH_TICKS = 2            # Min. 2 ciągłe próbki (0.5s), aby odrzucić szpilki napięcia z zasilania RPi0
-MOTION_WINDOW_SEC = 14.0        # Okno czasowe analizy obecności klienta (14 sekund)
-REQUIRED_ACTIVE_SEC = 3.5       # Wymagany łączny czas sygnału PIR w oknie (3.5s = podejście + drobny ruch)
-MOTION_REQUIRED_HITS = 3        # Skala prezentacji postępu na pasku w UI (0/3 .. 3/3)
+# Nowe podejście v1.0.12: Detekcja zbocza (0 -> 1) + Cisza Radiowa Wi-Fi
+SAMPLE_TICK_SEC = 0.25          # Próbkowanie co 0.25s
+QUIET_CONFIRM_SEC = 1.5         # Wymagane 1.5s ciszy (LOW) przed uzbrojeniem detekcji zbocza
+TRIGGER_HOLD_SEC = 1.5          # 1.5s ciągłego sygnału po zboczu wyzwala alarm (łapie pojedyncze podejście!)
+STUCK_HIGH_TIMEOUT_SEC = 12.0   # Jeśli czujnik wisi na HIGH > 12s, traktuj jako zakłócenie tła
+MOTION_REQUIRED_HITS = 3        # Skala dla paska postępu w UI (0/3 .. 3/3)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_FILE = os.path.join(BASE_DIR, "version.txt")
@@ -50,15 +49,16 @@ VAPID_CLAIMS = {"sub": "mailto:admin@twojadomena.pl"}
 app = Flask(__name__)
 state_lock = threading.Lock()
 subs_lock = threading.Lock()
+relay_wake_event = threading.Event()
 
 system_state = "DISARMED"   # DISARMED | ARMING | ARMED
 alert_type = "NONE"         # NONE | MOTION | HELP
 responder_name = ""
 cooldown_active = False
 
-# Bufor ostatnich potwierdzonych próbek aktywności (znaczniki czasu)
-active_samples = deque()
-waiting_for_sensor_quiet = False
+sensor_ready = False        # True dopiero gdy czujnik miał min. 1.5s ciszy (stanu LOW)
+current_pulse_sec = 0.0     # Czas trwania bieżącego impulsu po zboczu 0 -> 1
+ui_motion_hits = 0
 
 arm_timer = None
 cooldown_timer = None
@@ -91,7 +91,7 @@ def get_local_version():
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        return "1.0.11"
+        return "1.0.12"
 
 
 def get_local_changelog():
@@ -157,7 +157,7 @@ def fetch_github_text(raw_url):
 def refresh_github_info(force=False):
     global cached_remote_version, cached_remote_changelog, last_github_check_ts
     now = time.time()
-    if not force and cached_remote_version and (now - last_github_check_ts < 300):
+    if not force and cached_remote_version and (now - last_github_check_ts < 600):
         return cached_remote_version, cached_remote_changelog
 
     rem_ver = fetch_github_text(GITHUB_RAW_VERSION_URL)
@@ -210,7 +210,6 @@ def init_vapid_keys():
         except Exception as e:
             print(f"[BŁĄD ODCZYTU KLUCZY VAPID] {e}")
 
-    print("[VAPID] Generowanie nowej pary kluczy Web Push (ECDSA P-256)...")
     private_key = ec.generate_private_key(ec.SECP256R1())
     raw_priv = private_key.private_numbers().private_value.to_bytes(32, "big")
     raw_pub = private_key.public_key().public_bytes(
@@ -254,7 +253,6 @@ def add_subscription_entry(sub):
         if not any(s.get("endpoint") == sub["endpoint"] for s in subs):
             subs.append(sub)
             save_subscriptions(subs)
-            print(f"[WEB PUSH] Dodano subskrypcję (łącznie: {len(subs)})")
         return len(subs)
 
 
@@ -266,7 +264,6 @@ def remove_subscription_entry(endpoint):
         new_subs = [s for s in subs if s.get("endpoint") != endpoint]
         if len(new_subs) != len(subs):
             save_subscriptions(new_subs)
-            print(f"[WEB PUSH] Usunięto subskrypcję (pozostało: {len(new_subs)})")
         return len(new_subs)
 
 
@@ -313,19 +310,8 @@ switch = Button(SWITCH_PIN, pull_up=True, bounce_time=0.1)
 help_button = Button(HELP_BTN_PIN, pull_up=True, bounce_time=0.1)
 
 
-def get_current_hits_locked(now=None):
-    """Przelicza zgromadzony czas sygnału w oknie na skalę 0..3 dla interfejsu."""
-    if now is None:
-        now = time.time()
-    while active_samples and (now - active_samples[0] > MOTION_WINDOW_SEC):
-        active_samples.popleft()
-    active_sec = len(active_samples) * SAMPLE_TICK_SEC
-    ratio = min(1.0, active_sec / REQUIRED_ACTIVE_SEC)
-    return int(round(ratio * MOTION_REQUIRED_HITS))
-
-
 def cancel_timers():
-    global arm_timer, cooldown_timer, cooldown_active, waiting_for_sensor_quiet
+    global arm_timer, cooldown_timer, cooldown_active, sensor_ready, current_pulse_sec, ui_motion_hits
     if arm_timer is not None:
         arm_timer.cancel()
         arm_timer = None
@@ -333,29 +319,34 @@ def cancel_timers():
         cooldown_timer.cancel()
         cooldown_timer = None
     cooldown_active = False
-    waiting_for_sensor_quiet = False
-    active_samples.clear()
+    sensor_ready = False
+    current_pulse_sec = 0.0
+    ui_motion_hits = 0
 
 
 def finish_arming():
-    global system_state, waiting_for_sensor_quiet
+    global system_state, sensor_ready, current_pulse_sec, ui_motion_hits
     with state_lock:
         if system_state == "ARMING":
-            active_samples.clear()
-            waiting_for_sensor_quiet = True
+            sensor_ready = not pir.motion_detected
+            current_pulse_sec = 0.0
+            ui_motion_hits = 0
             system_state = "ARMED"
-            print("[SYSTEM] Uzbrojono (v1.0.11) - oczekiwanie na stan spoczynku czujnika PIR...")
+            print(f"[SYSTEM] Uzbrojono (v1.0.12) | Stan początkowy PIR: {'HIGH (czekam na opadnięcie)' if not sensor_ready else 'LOW (gotowy)'}")
+    relay_wake_event.set()
 
 
 def reset_cooldown():
-    global cooldown_active, alert_type, responder_name, waiting_for_sensor_quiet
+    global cooldown_active, alert_type, responder_name, sensor_ready, current_pulse_sec, ui_motion_hits
     with state_lock:
         cooldown_active = False
-        active_samples.clear()
-        waiting_for_sensor_quiet = True
+        sensor_ready = not pir.motion_detected
+        current_pulse_sec = 0.0
+        ui_motion_hits = 0
         if alert_type == "MOTION":
             alert_type = "NONE"
             responder_name = ""
+    relay_wake_event.set()
 
 
 def on_switch_on():
@@ -366,6 +357,7 @@ def on_switch_on():
         print(f"[SYSTEM] Włączono przełącznik - odliczanie {ARM_DELAY_SEC}s...")
         arm_timer = threading.Timer(ARM_DELAY_SEC, finish_arming)
         arm_timer.start()
+    relay_wake_event.set()
 
 
 def on_switch_off():
@@ -377,6 +369,7 @@ def on_switch_off():
             alert_type = "NONE"
             responder_name = ""
         print("[SYSTEM] Wyłączono przełącznik - system rozbrojony natychmiast.")
+    relay_wake_event.set()
 
 
 def trigger_help_request():
@@ -390,10 +383,11 @@ def trigger_help_request():
             "Kasjer prosi o wsparcie przy kasie!",
             "HELP"
         )
+    relay_wake_event.set()
 
 
 def handle_ack_action(worker_name):
-    global responder_name, cooldown_active, cooldown_timer
+    global responder_name, cooldown_active, cooldown_timer, ui_motion_hits
     worker = (worker_name or "Pracownik").strip() or "Pracownik"
     with state_lock:
         if alert_type != "NONE" and not responder_name:
@@ -401,7 +395,7 @@ def handle_ack_action(worker_name):
             if cooldown_timer is not None:
                 cooldown_timer.cancel()
             cooldown_active = True
-            active_samples.clear()
+            ui_motion_hits = 0
             cooldown_timer = threading.Timer(ACK_PAUSE_SEC, reset_cooldown)
             cooldown_timer.start()
             send_push_to_all(
@@ -409,28 +403,31 @@ def handle_ack_action(worker_name):
                 f"{worker} już idzie do kasy!",
                 "ACK"
             )
+    relay_wake_event.set()
 
 
 def handle_clear_action():
-    global alert_type, responder_name
+    global alert_type, responder_name, ui_motion_hits
     with state_lock:
         alert_type = "NONE"
         responder_name = ""
-        active_samples.clear()
+        ui_motion_hits = 0
+    relay_wake_event.set()
 
 
 def motion_monitor_loop():
     """
-    Pętla analizy sygnału PIR (Sliding Presence Window v1.0.11):
-    - Ignoruje pojedyncze szpilki napięcia (<0.5s) z linii zasilania RPi0.
-    - Po uzbrojeniu czeka, aż czujnik opadnie do zera przez pełną sekundę (brak samowzbudzenia po starcie).
-    - Sumuje realny czas obecności w oknie 14s, wykrywając także osoby stojące spokojnie.
+    Detekcja Zbocza 0 -> 1 (v1.0.12):
+    1. Wymaga, aby czujnik najpierw był w stanie LOW (sensor_ready = True).
+       Dzięki temu zawieszony stan HIGH przy starcie nigdy nie wywoła fałszywego alarmu.
+    2. Gdy czujnik przejdzie z LOW na HIGH i utrzyma sygnał przez TRIGGER_HOLD_SEC (1.5s),
+       natychmiast uruchamia alarm (wystarczy samo podejście klienta i zatrzymanie się).
     """
-    global alert_type, responder_name, cooldown_active, cooldown_timer, waiting_for_sensor_quiet
+    global alert_type, responder_name, cooldown_active, cooldown_timer
+    global sensor_ready, current_pulse_sec, ui_motion_hits
 
-    consecutive_high = 0
-    consecutive_low = 0
-    last_logged_hits = 0
+    low_sec = 0.0
+    high_sec = 0.0
 
     while True:
         time.sleep(SAMPLE_TICK_SEC)
@@ -438,70 +435,83 @@ def motion_monitor_loop():
 
         with state_lock:
             if system_state != "ARMED" or cooldown_active:
-                consecutive_high = 0
-                consecutive_low = 0
-                last_logged_hits = 0
+                low_sec = 0.0
+                high_sec = 0.0
+                current_pulse_sec = 0.0
+                ui_motion_hits = 0
                 continue
 
-            # Po uzbrojeniu czekamy, aż czujnik całkowicie się uspokoi (1s stanu LOW)
-            if waiting_for_sensor_quiet:
+            if not sensor_ready:
+                # Czekamy, aż czujnik zejdzie na LOW przez min. QUIET_CONFIRM_SEC (1.5s)
                 if not is_high:
-                    consecutive_low += 1
-                    if consecutive_low >= 4:  # 4 * 0.25s = 1.0s ciszy
-                        waiting_for_sensor_quiet = False
-                        consecutive_high = 0
-                        print("[SYSTEM] Czujnik PIR skalibrowany (stan LOW) - czuwanie aktywne.")
+                    low_sec += SAMPLE_TICK_SEC
+                    if low_sec >= QUIET_CONFIRM_SEC:
+                        sensor_ready = True
+                        high_sec = 0.0
+                        print("[SYSTEM] Czujnik PIR osiągnął stan spoczynku (LOW) - gotowy na wejście klienta.")
+                        relay_wake_event.set()
                 else:
-                    consecutive_low = 0
+                    low_sec = 0.0
                 continue
 
-            now = time.time()
-            while active_samples and (now - active_samples[0] > MOTION_WINDOW_SEC):
-                active_samples.popleft()
-
+            # Czujnik był w stanie spoczynku i jest gotowy na zbocze 0 -> 1
             if is_high:
-                consecutive_high += 1
-                # Dopiero po MIN_GLITCH_TICKS (0.5s) uznajemy sygnał za prawdziwą podczerwień, a nie szum kabla
-                if consecutive_high == MIN_GLITCH_TICKS:
-                    for i in range(MIN_GLITCH_TICKS):
-                        active_samples.append(now - (MIN_GLITCH_TICKS - 1 - i) * SAMPLE_TICK_SEC)
-                elif consecutive_high > MIN_GLITCH_TICKS:
-                    active_samples.append(now)
+                high_sec += SAMPLE_TICK_SEC
+                current_pulse_sec = high_sec
+
+                # Zabezpieczenie: gdyby czujnik zablokował się sprzętowo powyżej 12s
+                if high_sec > STUCK_HIGH_TIMEOUT_SEC:
+                    sensor_ready = False
+                    low_sec = 0.0
+                    high_sec = 0.0
+                    ui_motion_hits = 0
+                    continue
+
+                ratio = min(1.0, high_sec / TRIGGER_HOLD_SEC)
+                new_hits = int(round(ratio * MOTION_REQUIRED_HITS))
+                if new_hits != ui_motion_hits:
+                    ui_motion_hits = new_hits
+                    print(f"[DETEKTOR] Impuls wejścia klienta: {high_sec:.2f}s / {TRIGGER_HOLD_SEC:.2f}s ({ui_motion_hits}/{MOTION_REQUIRED_HITS})")
+
+                if high_sec >= TRIGGER_HOLD_SEC:
+                    high_sec = 0.0
+                    current_pulse_sec = 0.0
+                    ui_motion_hits = 0
+                    sensor_ready = False
+                    alert_type = "MOTION"
+                    responder_name = ""
+                    cooldown_active = True
+                    print("[ALARM] Wykryto podejście klienta do kasy! Wysyłam powiadomienia.")
+                    send_push_to_all(
+                        "🚨 Klient czeka przy kasie!",
+                        "Wykryto podejście klienta do pustej kasy. Kliknij, aby przyjąć.",
+                        "MOTION"
+                    )
+                    cooldown_timer = threading.Timer(COOLDOWN_SEC, reset_cooldown)
+                    cooldown_timer.start()
+                    relay_wake_event.set()
             else:
-                consecutive_high = 0
-
-            active_sec = len(active_samples) * SAMPLE_TICK_SEC
-            current_hits = get_current_hits_locked(now)
-
-            if current_hits != last_logged_hits and current_hits > 0:
-                print(
-                    f"[DETEKTOR] Aktywność przy kasie: {active_sec:.2f}s / {REQUIRED_ACTIVE_SEC:.1f}s "
-                    f"(poziom {current_hits}/{MOTION_REQUIRED_HITS})"
-                )
-                last_logged_hits = current_hits
-            elif current_hits == 0:
-                last_logged_hits = 0
-
-            if active_sec >= REQUIRED_ACTIVE_SEC:
-                active_samples.clear()
-                consecutive_high = 0
-                last_logged_hits = 0
-                alert_type = "MOTION"
-                responder_name = ""
-                cooldown_active = True
-                print("[ALARM] Potwierdzono obecność klienta przy kasie! Wysyłam powiadomienia.")
-                send_push_to_all(
-                    "🚨 Klient czeka przy kasie!",
-                    "Wykryto obecność klienta przy pustej kasie. Kliknij, aby przyjąć.",
-                    "MOTION"
-                )
-                cooldown_timer = threading.Timer(COOLDOWN_SEC, reset_cooldown)
-                cooldown_timer.start()
+                if high_sec > 0:
+                    high_sec = 0.0
+                    current_pulse_sec = 0.0
+                    ui_motion_hits = 0
 
 
 def firebase_relay_loop():
+    """
+    Tryb Ciszy Radiowej podczas czuwania (v1.0.12):
+    Gdy system czuwa (ARMED i brak alarmu), synchronizuje się z Firebase rzadko (co 20s)
+    lub natychmiast po wykryciu zdarzenia (relay_wake_event).
+    Eliminuje to skoki napięcia od Wi-Fi/SSL co 2.5s, które wzbudzały czujnik PIR!
+    """
     while True:
-        time.sleep(2.5)
+        with state_lock:
+            is_idle_armed = (system_state == "ARMED" and alert_type == "NONE")
+
+        wait_timeout = 20.0 if is_idle_armed else 3.0
+        relay_wake_event.wait(timeout=wait_timeout)
+        relay_wake_event.clear()
+
         cfg = load_cloud_config()
         if not cfg.get("lte_enabled"):
             continue
@@ -519,8 +529,10 @@ def firebase_relay_loop():
                     "system_state": system_state,
                     "alert_type": alert_type,
                     "responder_name": responder_name,
-                    "motion_hits": get_current_hits_locked(now),
+                    "motion_hits": ui_motion_hits,
                     "motion_required": MOTION_REQUIRED_HITS,
+                    "pir_raw": pir.motion_detected,
+                    "sensor_ready": sensor_ready,
                     "version": loc_ver,
                     "remote_version": rem_ver or loc_ver,
                     "update_available": parse_version(rem_ver) > parse_version(loc_ver) if rem_ver else False,
@@ -604,15 +616,16 @@ def unsubscribe_push():
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    now = time.time()
     cfg = load_cloud_config()
     with state_lock:
         return jsonify({
             "system_state": system_state,
             "alert_type": alert_type,
             "responder_name": responder_name,
-            "motion_hits": get_current_hits_locked(now),
+            "motion_hits": ui_motion_hits,
             "motion_required": MOTION_REQUIRED_HITS,
+            "pir_raw": pir.motion_detected,
+            "sensor_ready": sensor_ready,
             "version": get_local_version(),
             "subscribed_devices": len(load_subscriptions()),
             "vapid_public_key": VAPID_PUBLIC_KEY,
@@ -639,6 +652,7 @@ def api_lte_mode():
             subprocess.run(f"systemctl stop {TUNNEL_SERVICE_NAME} 2>/dev/null", shell=True)
             subprocess.run(f"systemctl disable {TUNNEL_SERVICE_NAME} 2>/dev/null", shell=True)
 
+    relay_wake_event.set()
     return jsonify({"ok": True, "lte_enabled": cfg.get("lte_enabled", False)})
 
 
