@@ -1,2 +1,5 @@
-Wersja 1.0.12:
--bugfix
+Wersja 1.1.0:
+- Obsługa laserowego czujnika odległości ToF VL53L1X (I2C) z pomiarem w milimetrach
+- Automatyczna kalibracja dystansu tła (regału) przy uzbrajaniu systemu
+- Podgląd zmierzonej odległości na żywo w API (distance_mm oraz trigger_threshold_mm)
+- Dodatkowe endpointy REST API do szybkiego odczytu i zmiany progu odległości w locie
